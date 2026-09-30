@@ -260,16 +260,81 @@ def check_position(key,state,s,candle):
 
 def stats(state):
     t=state['total_trades']; w=state['winning_trades']; pf=state['gross_profit']/state['gross_loss'] if state['gross_loss'] else (999 if state['gross_profit'] else 0)
-    return {'balance':state['balance'],'return_pct':(state['balance']/START_BALANCE-1)*100,'trades':t,'winrate':100*w/t if t else 0,'pf':pf,'max_dd':100*state['max_drawdown'],'open_risk_pct':100*open_risk(state)}
+    return {'balance':state['balance'],'peak_balance':state.get('peak_balance',state['balance']),'return_pct':(state['balance']/START_BALANCE-1)*100,'net_pnl':state['balance']-START_BALANCE,'net_r':(state['balance']-START_BALANCE)/(START_BALANCE*RISK_PER_TRADE) if RISK_PER_TRADE else 0,'trades':t,'wins':w,'losses':state.get('losing_trades',0),'winrate':100*w/t if t else 0,'pf':pf,'max_dd':100*state['max_drawdown'],'open_risk_pct':100*open_risk(state)}
 
-DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>BTC V1</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0f14;color:#f4f5f7;margin:0;padding:16px}.w{max-width:1100px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}.card{background:#171a22;border:1px solid #292d39;border-radius:14px;padding:14px}.big{font-size:24px;font-weight:800}.muted{color:#9ca3af}.pos{color:#59d18b}.neg{color:#ff6b6b}.tag{display:inline-block;padding:4px 8px;border-radius:999px;background:#242936;margin:3px}a{color:#fff}table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:7px;border-bottom:1px solid #292d39;text-align:left}</style></head><body><div class="w"><h1>BTC V1</h1><div class="muted">Regime-aware · closed HTF candles · realistic costs · shared risk · paper only</div><div class="grid" style="margin-top:14px"><div class="card"><div class="muted">Balance</div><div class="big {{'pos' if s.return_pct>=0 else 'neg'}}">€{{'%.2f'|format(s.balance)}}</div><div>{{'%+.2f'|format(s.return_pct)}}%</div></div><div class="card"><div class="muted">Trades</div><div class="big">{{s.trades}}</div><div>{{'%.1f'|format(s.winrate)}}% win</div></div><div class="card"><div class="muted">Profit factor</div><div class="big">{{'%.2f'|format(s.pf) if s.pf<900 else '∞'}}</div><div>DD {{'%.2f'|format(s.max_dd)}}%</div></div><div class="card"><div class="muted">Regime</div><div class="big">{{r.regime}}</div><div>{{r.direction}} · ADX {{'%.1f'|format(r.adx) if r.adx else '—'}}</div></div><div class="card"><div class="muted">Open risk</div><div class="big">{{'%.2f'|format(s.open_risk_pct)}}%</div><div>cap {{'%.2f'|format(maxrisk)}}%</div></div></div><div class="card" style="margin-top:10px"><b>Engines</b><br>{% for k,x in engines.items() %}<span class="tag">{{k}}: {{'LIVE' if x.enabled else 'SHADOW'}}</span>{% endfor %}</div><div class="card" style="margin-top:10px"><a href="/download/trades">trades.csv</a> · <a href="/download/features">entry_features.csv</a> · <a href="/download/decisions">decisions.csv</a></div><div class="card" style="margin-top:10px"><b>Laatste trades</b><table><tr><th>Strategy</th><th>Side</th><th>Exit</th><th>Net R</th><th>P/L</th></tr>{% for t in recent %}<tr><td>{{t.strategy}}</td><td>{{t.side}}</td><td>{{t.reason}}</td><td>{{'%.2f'|format(t.net_R)}}</td><td class="{{'pos' if t.pnl_eur>=0 else 'neg'}}">€{{'%+.2f'|format(t.pnl_eur)}}</td></tr>{% endfor %}</table></div></div></body></html>'''
+
+def _read_csv_records(path,n=50):
+    try:
+        if not os.path.exists(path): return []
+        d=pd.read_csv(path).replace({np.nan:None})
+        return d.tail(n).iloc[::-1].to_dict('records')
+    except Exception:return []
+
+def strategy_dashboard(state):
+    trades=pd.DataFrame(_read_csv_records(TRADES_FILE,100000))
+    out=[]
+    for key,cfg in STRATEGIES.items():
+        st=state['strategies'][key]
+        d=trades[trades.strategy==key].copy() if len(trades) and 'strategy' in trades else pd.DataFrame()
+        n=len(d)
+        pnl_series=pd.to_numeric(d['pnl_eur'],errors='coerce').fillna(0) if n else pd.Series(dtype=float)
+        wins=int((pnl_series>0).sum()) if n else 0
+        pnl=float(pnl_series.sum()) if n else 0.0
+        nr=float(pd.to_numeric(d['net_R'],errors='coerce').fillna(0).sum()) if n else 0.0
+        gp=float(pnl_series[pnl_series>0].sum()) if n else 0.0
+        gl=abs(float(pnl_series[pnl_series<0].sum())) if n else 0.0
+        pf=gp/gl if gl else (999 if gp else 0)
+        out.append({'key':key,'label':cfg['label'],'mode':'LIVE' if cfg['enabled'] else 'SHADOW',
+                    'trades':n,'winrate':100*wins/n if n else 0,'pnl':pnl,'net_r':nr,'pf':pf,
+                    'signals':st.get('signals',0),'blocked':st.get('blocked',0),
+                    'loss_streak':st.get('loss_streak',0),'cooldown_until':st.get('cooldown_until'),
+                    'last_signal':st.get('last_signal','—')})
+    return out
+
+def open_positions_dashboard(state,last_price):
+    out=[]
+    for key,st in state['strategies'].items():
+        p=st.get('position')
+        if not p: continue
+        cur_r=((last_price-p['entry_price'])/p['stop_distance']) if p['side']=='LONG' else ((p['entry_price']-last_price)/p['stop_distance'])
+        out.append({**p,'strategy':key,'current_price':last_price,'current_r':cur_r})
+    return out
+
+def regime_performance():
+    try:
+        t=pd.read_csv(TRADES_FILE); f=pd.read_csv(FEATURES_FILE)
+        if not len(t) or not len(f) or 'regime' not in f:return []
+        m=t.merge(f[['strategy','time','regime']],left_on=['strategy','entry_time'],right_on=['strategy','time'],how='left')
+        out=[]
+        for rg,d in m.groupby('regime',dropna=True):
+            pnl=pd.to_numeric(d.pnl_eur,errors='coerce').fillna(0)
+            nr=pd.to_numeric(d.net_R,errors='coerce').fillna(0)
+            out.append({'regime':rg,'trades':len(d),'winrate':100*(pnl>0).mean(),'pnl':float(pnl.sum()),'net_r':float(nr.sum())})
+        return sorted(out,key=lambda x:x['trades'],reverse=True)
+    except Exception:return []
+DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>BTC V1 Control Center</title><style>
+:root{--bg:#0b0e13;--card:#151922;--card2:#10141c;--line:#2a3140;--text:#f5f7fb;--muted:#8e98aa;--green:#55d68b;--red:#ff6b72;--amber:#f3c969}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:14px}.w{max-width:1250px;margin:auto}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:8px 2px 16px}.title{font-size:34px;font-weight:900}.sub,.muted{color:var(--muted)}.running{font-size:12px;padding:6px 9px;border-radius:999px;background:#153222;color:var(--green);font-weight:800}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:9px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px}.label{font-size:11px;color:var(--muted);text-transform:uppercase}.value{font-size:24px;font-weight:850;margin-top:4px}.mini{font-size:12px;margin-top:3px}.pos{color:var(--green)!important}.neg{color:var(--red)!important}.amber{color:var(--amber)!important}.section{margin-top:10px}.section h2{font-size:16px;margin:0 0 10px}.market{display:grid;grid-template-columns:1.4fr repeat(4,1fr);gap:9px}.tag{display:inline-block;padding:4px 7px;border-radius:999px;font-size:10px}.live{background:#153222;color:var(--green)}.shadow{background:#332d18;color:var(--amber)}.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}td,th{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:10px;text-transform:uppercase}.strategy{font-weight:750}.pill{padding:3px 6px;border-radius:6px;background:#242b39;font-size:10px}.two{display:grid;grid-template-columns:1.35fr 1fr;gap:10px}.empty{padding:18px;text-align:center;color:var(--muted);background:var(--card2);border-radius:10px}.downloads{display:flex;gap:8px;flex-wrap:wrap}.btn{color:var(--text);text-decoration:none;background:#242b39;border:1px solid #343d4f;border-radius:9px;padding:8px 10px;font-size:12px}.small{font-size:10px}
+@media(max-width:900px){.grid{grid-template-columns:repeat(3,1fr)}.market{grid-template-columns:repeat(3,1fr)}.two{grid-template-columns:1fr}}@media(max-width:520px){body{padding:10px}.grid{grid-template-columns:repeat(2,1fr)}.market{grid-template-columns:repeat(2,1fr)}.market>div:first-child{grid-column:span 2}.card{padding:11px}.value{font-size:21px}}
+</style></head><body><div class="w"><div class="top"><div><div class="title">BTC V1</div><div class="sub">Control Center · paper trading · refresh 20s</div></div><div class="running">● RUNNING</div></div>
+<div class="grid">
+<div class="card"><div class="label">Balance</div><div class="value {{'pos' if s.return_pct>=0 else 'neg'}}">€{{'%.2f'|format(s.balance)}}</div><div class="mini">{{'%+.2f'|format(s.return_pct)}}%</div></div>
+<div class="card"><div class="label">Net P/L</div><div class="value {{'pos' if s.net_pnl>=0 else 'neg'}}">€{{'%+.2f'|format(s.net_pnl)}}</div><div class="mini">{{'%+.2f'|format(s.net_r)}}R totaal</div></div>
+<div class="card"><div class="label">Trades</div><div class="value">{{s.trades}}</div><div class="mini">{{s.wins}}W · {{s.losses}}L</div></div>
+<div class="card"><div class="label">Winrate</div><div class="value">{{'%.1f'|format(s.winrate)}}%</div><div class="mini">PF {{'%.2f'|format(s.pf) if s.pf<900 else '∞'}}</div></div>
+<div class="card"><div class="label">Max DD</div><div class="value {{'neg' if s.max_dd<0 else ''}}">{{'%.2f'|format(s.max_dd)}}%</div><div class="mini">Peak €{{'%.2f'|format(s.peak_balance)}}</div></div>
+<div class="card"><div class="label">Open risk</div><div class="value">{{'%.2f'|format(s.open_risk_pct)}}%</div><div class="mini">cap {{'%.2f'|format(maxrisk)}}%</div></div></div>
+<div class="section market"><div class="card"><div class="label">Market regime</div><div class="value">{{r.regime}}</div><div class="mini">{{r.direction}} · BTC ${{'{:,.0f}'.format(r.price) if r.price else '—'}}</div></div><div class="card"><div class="label">ADX 1H</div><div class="value">{{'%.1f'|format(r.adx) if r.adx is not none else '—'}}</div></div><div class="card"><div class="label">ER24 1H</div><div class="value">{{'%.3f'|format(r.er24) if r.er24 is not none else '—'}}</div></div><div class="card"><div class="label">Vol ratio</div><div class="value">{{'%.2f'|format(r.vol_ratio) if r.vol_ratio is not none else '—'}}</div></div><div class="card"><div class="label">Open positions</div><div class="value">{{openpos|length}}</div></div></div>
+<div class="card section"><h2>Engine monitor</h2><div class="tablewrap"><table><tr><th>Engine</th><th>Mode</th><th>Trades</th><th>WR</th><th>Net R</th><th>P/L</th><th>PF</th><th>Signals</th><th>Blocked</th><th>Loss streak</th><th>Laatste signal</th></tr>{% for x in strat %}<tr><td><div class="strategy">{{x.label}}</div><div class="muted small">{{x.key}}</div></td><td><span class="tag {{'live' if x.mode=='LIVE' else 'shadow'}}">{{x.mode}}</span></td><td>{{x.trades}}</td><td>{{'%.1f'|format(x.winrate)}}%</td><td class="{{'pos' if x.net_r>0 else 'neg' if x.net_r<0 else ''}}">{{'%+.2f'|format(x.net_r)}}</td><td class="{{'pos' if x.pnl>0 else 'neg' if x.pnl<0 else ''}}">€{{'%+.2f'|format(x.pnl)}}</td><td>{{'%.2f'|format(x.pf) if x.pf<900 else '∞'}}</td><td>{{x.signals}}</td><td>{{x.blocked}}</td><td>{{x.loss_streak}}</td><td>{{x.last_signal}}{% if x.cooldown_until %}<div class="amber small">Cooldown → {{x.cooldown_until[11:16]}}</div>{% endif %}</td></tr>{% endfor %}</table></div></div>
+<div class="card section"><h2>Open trades</h2>{% if openpos %}<div class="tablewrap"><table><tr><th>Strategy</th><th>Side</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Current R</th><th>MFE</th><th>MAE</th><th>Risk €</th></tr>{% for p in openpos %}<tr><td class="strategy">{{p.strategy}}</td><td>{{p.side}}</td><td>${{'{:,.0f}'.format(p.entry_price)}}</td><td>${{'{:,.0f}'.format(p.current_price)}}</td><td>${{'{:,.0f}'.format(p.stop)}}</td><td>${{'{:,.0f}'.format(p.target)}}</td><td class="{{'pos' if p.current_r>=0 else 'neg'}}">{{'%+.2f'|format(p.current_r)}}R</td><td class="pos">{{'%.2f'|format(p.mfe_r)}}R</td><td class="neg">{{'%.2f'|format(p.mae_r)}}R</td><td>€{{'%.2f'|format(p.risk_eur)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Geen open trades — V1 wacht op een geldige setup.</div>{% endif %}</div>
+<div class="two section"><div class="card"><h2>Recente decisions / signals</h2>{% if decisions %}<div class="tablewrap"><table><tr><th>Tijd</th><th>Strategy</th><th>Side</th><th>Decision</th><th>Setup</th><th>Regime</th><th>ADX</th></tr>{% for d in decisions %}<tr><td>{{d.time[11:16] if d.time else '—'}}</td><td class="strategy">{{d.strategy}}</td><td>{{d.side}}</td><td><span class="pill {{'pos' if d.decision=='OPEN' else 'amber' if d.decision=='SHADOW' else ''}}">{{d.decision}}</span></td><td>{{d.setup}}</td><td>{{d.regime}}</td><td>{{'%.1f'|format(d.adx_1h) if d.adx_1h is not none else '—'}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen signalen gelogd.</div>{% endif %}</div><div class="card"><h2>Performance per regime</h2>{% if regimes %}<div class="tablewrap"><table><tr><th>Regime</th><th>Trades</th><th>WR</th><th>Net R</th><th>P/L</th></tr>{% for x in regimes %}<tr><td class="strategy">{{x.regime}}</td><td>{{x.trades}}</td><td>{{'%.1f'|format(x.winrate)}}%</td><td class="{{'pos' if x.net_r>0 else 'neg' if x.net_r<0 else ''}}">{{'%+.2f'|format(x.net_r)}}</td><td class="{{'pos' if x.pnl>0 else 'neg' if x.pnl<0 else ''}}">€{{'%+.2f'|format(x.pnl)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Regime-statistieken verschijnen na de eerste gesloten trades.</div>{% endif %}</div></div>
+<div class="card section"><h2>Trade history</h2>{% if recent %}<div class="tablewrap"><table><tr><th>Exit</th><th>Strategy</th><th>Side</th><th>Setup</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Raw R</th><th>Net R</th><th>MFE</th><th>MAE</th><th>Costs</th><th>P/L</th><th>Balance</th></tr>{% for t in recent %}<tr><td>{{t.exit_time[5:16]|replace('T',' ')}}</td><td class="strategy">{{t.strategy}}</td><td>{{t.side}}</td><td>{{t.setup}}</td><td>${{'{:,.0f}'.format(t.entry)}}</td><td>${{'{:,.0f}'.format(t.exit)}}</td><td>{{t.reason}}</td><td>{{'%+.2f'|format(t.raw_R)}}R</td><td class="{{'pos' if t.net_R>=0 else 'neg'}}">{{'%+.2f'|format(t.net_R)}}R</td><td class="pos">{{'%.2f'|format(t.MFE_R)}}R</td><td class="neg">{{'%.2f'|format(t.MAE_R)}}R</td><td>€{{'%.2f'|format(t.fees_eur+t.slippage_eur)}}</td><td class="{{'pos' if t.pnl_eur>=0 else 'neg'}}">€{{'%+.2f'|format(t.pnl_eur)}}</td><td>€{{'%.2f'|format(t.balance)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen gesloten trades.</div>{% endif %}</div>
+<div class="card section"><h2>Data & exports</h2><div class="downloads"><a class="btn" href="/download/trades">↓ Trades CSV</a><a class="btn" href="/download/features">↓ Entry features CSV</a><a class="btn" href="/download/decisions">↓ Decisions CSV</a><a class="btn" href="/api/status">API status</a></div></div></div></body></html>'''
 app=Flask(__name__)
-def recent(n=20):
-    try:return pd.read_csv(TRADES_FILE).tail(n).iloc[::-1].to_dict('records')
-    except:return []
+def recent(n=30): return _read_csv_records(TRADES_FILE,n)
 @app.get('/')
 def dashboard():
-    st=load_state(); c=load_candles(); return render_template_string(DASH,s=stats(st),r=regime_snapshot(c),engines=STRATEGIES,recent=recent(),maxrisk=MAX_TOTAL_RISK*100)
+    st=load_state(); c=load_candles(); r=regime_snapshot(c); price=float(c.close.iloc[-1]) if len(c) else 0
+    return render_template_string(DASH,s=stats(st),r=r,strat=strategy_dashboard(st),openpos=open_positions_dashboard(st,price),decisions=_read_csv_records(DECISIONS_FILE,20),regimes=regime_performance(),recent=recent(),maxrisk=MAX_TOTAL_RISK*100)
 @app.get('/api/status')
 def status():
     st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.0','stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
