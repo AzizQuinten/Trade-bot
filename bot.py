@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-# BTC V1.2 — regime-aware PAPER trading engine + scan diagnostics
+# BTC V1.3 — stable decision schema + cost transparency
 INST_ID = os.getenv('INST_ID', 'BTC-USDT')
 START_BALANCE = float(os.getenv('START_BALANCE', '500'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
@@ -39,7 +39,7 @@ STRATEGIES = {
  'MEAN_REVERSION': {'label':'Mean Reversion 2.0','rr':1.6,'stop_atr':1.35,'max_hours':4,'enabled':False},
 }
 
-session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.2'})
+session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.3'})
 state_lock=threading.RLock()
 def utc_now(): return datetime.now(timezone.utc)
 def finite(x):
@@ -49,7 +49,7 @@ def finite(x):
 def strategy_default():
     return {'position':None,'loss_streak':0,'cooldown_until':None,'scans':0,'signals':0,'blocked':0,'last_signal':'—','last_signal_time':None}
 def default_state():
-    return {'version':'BTC-V1.2','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'strategies':{k:strategy_default() for k in STRATEGIES}}
+    return {'version':'BTC-V1.3','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'strategies':{k:strategy_default() for k in STRATEGIES}}
 def normalize_state(s):
     base=default_state()
     for k,v in base.items(): s.setdefault(k,v)
@@ -161,8 +161,48 @@ def router(key,side,snap):
 def features(key,side,reason,d5,d15,d1,d4,snap):
     c5,c15,c1,c4=d5.iloc[-1],d15.iloc[-1],d1.iloc[-1],d4.iloc[-1]
     return {'time':d5.index[-1].isoformat(),'strategy':key,'side':side or 'NONE','setup':reason,'regime':snap.get('regime'),'direction':snap.get('direction'),'price':float(c5.close),'rsi_5m':float(c5.rsi) if finite(c5.rsi) else None,'adx_1h':snap.get('adx'),'er24_1h':snap.get('er24'),'vol_ratio_1h':snap.get('vol_ratio'),'atr_pct_5m':float(c5.atr/c5.close) if finite(c5.atr) else None,'body_atr_5m':float(c5.body_atr) if finite(c5.body_atr) else None,'volume_ratio_5m':float(c5.volume_ratio) if finite(c5.volume_ratio) else None,'volume_ratio_15m':float(c15.volume_ratio) if finite(c15.volume_ratio) else None,'ema20_slope3_15m':float(c15.ema20_slope3) if finite(c15.ema20_slope3) else None,'ema20_slope3_1h':float(c1.ema20_slope3) if finite(c1.ema20_slope3) else None,'ema20_slope3_4h':float(c4.ema20_slope3) if finite(c4.ema20_slope3) else None}
+DECISION_COLUMNS=[
+    'time','strategy','side','setup','regime','direction','price','rsi_5m','adx_1h','er24_1h',
+    'vol_ratio_1h','atr_pct_5m','body_atr_5m','volume_ratio_5m','volume_ratio_15m',
+    'ema20_slope3_15m','ema20_slope3_1h','ema20_slope3_4h',
+    'router_allowed','router_reason','decision','open_risk_pct'
+]
+
 def append_csv(path,row):
-    exists=os.path.exists(path); pd.DataFrame([row]).to_csv(path,mode='a' if exists else 'w',header=not exists,index=False)
+    exists=os.path.exists(path)
+    pd.DataFrame([row]).to_csv(path,mode='a' if exists else 'w',header=not exists,index=False)
+
+def normalize_decision(row):
+    # One immutable schema for NO_SETUP / OPEN / SHADOW / every BLOCK state.
+    clean={k:None for k in DECISION_COLUMNS}
+    for k in DECISION_COLUMNS:
+        if k in row: clean[k]=row.get(k)
+    return clean
+
+def append_decision(row):
+    clean=normalize_decision(row)
+    exists=os.path.exists(DECISIONS_FILE) and os.path.getsize(DECISIONS_FILE)>0
+    pd.DataFrame([clean],columns=DECISION_COLUMNS).to_csv(
+        DECISIONS_FILE,mode='a' if exists else 'w',header=not exists,index=False
+    )
+
+def repair_decisions_file():
+    """Rotate an old malformed decisions CSV instead of silently losing it."""
+    if not os.path.exists(DECISIONS_FILE) or os.path.getsize(DECISIONS_FILE)==0:return
+    bad=False
+    try:
+        with open(DECISIONS_FILE,newline='',encoding='utf-8') as f:
+            rows=list(csv.reader(f))
+        if not rows:return
+        if rows[0] != DECISION_COLUMNS: bad=True
+        elif any(len(r)!=len(DECISION_COLUMNS) for r in rows[1:]): bad=True
+    except Exception:
+        bad=True
+    if bad:
+        stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        backup=DECISIONS_FILE.replace('.csv',f'_legacy_{stamp}.csv')
+        os.replace(DECISIONS_FILE,backup)
+        print(f'[MIGRATION] malformed decisions CSV rotated to {backup}',flush=True)
 
 def signal_for(key,c,snap):
     if len(c)<600:return None
@@ -371,17 +411,29 @@ DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="v
 <div class="card section"><h2>Engine monitor</h2><div class="tablewrap"><table><tr><th>Engine</th><th>Mode</th><th>Trades</th><th>WR</th><th>Net R</th><th>P/L</th><th>PF</th><th>Signals</th><th>Blocked</th><th>Loss streak</th><th>Laatste signal</th></tr>{% for x in strat %}<tr><td><div class="strategy">{{x.label}}</div><div class="muted small">{{x.key}}</div></td><td><span class="tag {{'live' if x.mode=='LIVE' else 'shadow'}}">{{x.mode}}</span></td><td>{{x.trades}}</td><td>{{'%.1f'|format(x.winrate)}}%</td><td class="{{'pos' if x.net_r>0 else 'neg' if x.net_r<0 else ''}}">{{'%+.2f'|format(x.net_r)}}</td><td class="{{'pos' if x.pnl>0 else 'neg' if x.pnl<0 else ''}}">€{{'%+.2f'|format(x.pnl)}}</td><td>{{'%.2f'|format(x.pf) if x.pf<900 else '∞'}}</td><td>{{x.signals}}</td><td>{{x.blocked}}</td><td>{{x.loss_streak}}</td><td>{{x.last_signal}}{% if x.cooldown_until %}<div class="amber small">Cooldown → {{x.cooldown_until[11:16]}}</div>{% endif %}</td></tr>{% endfor %}</table></div></div>
 <div class="card section"><h2>Open trades</h2>{% if openpos %}<div class="tablewrap"><table><tr><th>Strategy</th><th>Side</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Current R</th><th>MFE</th><th>MAE</th><th>Risk €</th></tr>{% for p in openpos %}<tr><td class="strategy">{{p.strategy}}</td><td>{{p.side}}</td><td>${{'{:,.0f}'.format(p.entry_price)}}</td><td>${{'{:,.0f}'.format(p.current_price)}}</td><td>${{'{:,.0f}'.format(p.stop)}}</td><td>${{'{:,.0f}'.format(p.target)}}</td><td class="{{'pos' if p.current_r>=0 else 'neg'}}">{{'%+.2f'|format(p.current_r)}}R</td><td class="pos">{{'%.2f'|format(p.mfe_r)}}R</td><td class="neg">{{'%.2f'|format(p.mae_r)}}R</td><td>€{{'%.2f'|format(p.risk_eur)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Geen open trades — V1 wacht op een geldige setup.</div>{% endif %}</div>
 <div class="two section"><div class="card"><h2>Recente decisions / signals</h2>{% if decisions %}<div class="tablewrap"><table><tr><th>Tijd</th><th>Strategy</th><th>Side</th><th>Decision</th><th>Setup</th><th>Regime</th><th>ADX</th></tr>{% for d in decisions %}<tr><td>{{d.time[11:16] if d.time else '—'}}</td><td class="strategy">{{d.strategy}}</td><td>{{d.side}}</td><td><span class="pill {{'pos' if d.decision=='OPEN' else 'amber' if d.decision=='SHADOW' else ''}}">{{d.decision}}</span></td><td>{{d.setup}}</td><td>{{d.regime}}</td><td>{{'%.1f'|format(d.adx_1h) if d.adx_1h is not none else '—'}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen signalen gelogd.</div>{% endif %}</div><div class="card"><h2>Performance per regime</h2>{% if regimes %}<div class="tablewrap"><table><tr><th>Regime</th><th>Trades</th><th>WR</th><th>Net R</th><th>P/L</th></tr>{% for x in regimes %}<tr><td class="strategy">{{x.regime}}</td><td>{{x.trades}}</td><td>{{'%.1f'|format(x.winrate)}}%</td><td class="{{'pos' if x.net_r>0 else 'neg' if x.net_r<0 else ''}}">{{'%+.2f'|format(x.net_r)}}</td><td class="{{'pos' if x.pnl>0 else 'neg' if x.pnl<0 else ''}}">€{{'%+.2f'|format(x.pnl)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Regime-statistieken verschijnen na de eerste gesloten trades.</div>{% endif %}</div></div>
-<div class="card section"><h2>Trade history</h2>{% if recent %}<div class="tablewrap"><table><tr><th>Exit</th><th>Strategy</th><th>Side</th><th>Setup</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Raw R</th><th>Net R</th><th>MFE</th><th>MAE</th><th>Costs</th><th>P/L</th><th>Balance</th></tr>{% for t in recent %}<tr><td>{{t.exit_time[5:16]|replace('T',' ')}}</td><td class="strategy">{{t.strategy}}</td><td>{{t.side}}</td><td>{{t.setup}}</td><td>${{'{:,.0f}'.format(t.entry)}}</td><td>${{'{:,.0f}'.format(t.exit)}}</td><td>{{t.reason}}</td><td>{{'%+.2f'|format(t.raw_R)}}R</td><td class="{{'pos' if t.net_R>=0 else 'neg'}}">{{'%+.2f'|format(t.net_R)}}R</td><td class="pos">{{'%.2f'|format(t.MFE_R)}}R</td><td class="neg">{{'%.2f'|format(t.MAE_R)}}R</td><td>€{{'%.2f'|format(t.fees_eur+t.slippage_eur)}}</td><td class="{{'pos' if t.pnl_eur>=0 else 'neg'}}">€{{'%+.2f'|format(t.pnl_eur)}}</td><td>€{{'%.2f'|format(t.balance)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen gesloten trades.</div>{% endif %}</div>
+<div class="card section"><h2>Trade history</h2>{% if recent %}<div class="tablewrap"><table><tr><th>Exit</th><th>Strategy</th><th>Side</th><th>Setup</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross R</th><th>Costs R</th><th>Net R</th><th>MFE</th><th>MAE</th><th>Costs €</th><th>P/L</th><th>Balance</th></tr>{% for t in recent %}<tr><td>{{t.exit_time[5:16]|replace('T',' ')}}</td><td class="strategy">{{t.strategy}}</td><td>{{t.side}}</td><td>{{t.setup}}</td><td>${{'{:,.0f}'.format(t.entry)}}</td><td>${{'{:,.0f}'.format(t.exit)}}</td><td>{{t.reason}}</td><td>{{'%+.2f'|format(t.raw_R)}}R</td><td class="amber">-{{'%.2f'|format(t.costs_R)}}R</td><td class="{{'pos' if t.net_R>=0 else 'neg'}}">{{'%+.2f'|format(t.net_R)}}R</td><td class="pos">{{'%.2f'|format(t.MFE_R)}}R</td><td class="neg">{{'%.2f'|format(t.MAE_R)}}R</td><td>€{{'%.2f'|format(t.costs_eur)}}</td><td class="{{'pos' if t.pnl_eur>=0 else 'neg'}}">€{{'%+.2f'|format(t.pnl_eur)}}</td><td>€{{'%.2f'|format(t.balance)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen gesloten trades.</div>{% endif %}</div>
 <div class="card section"><h2>Data & exports</h2><div class="downloads"><a class="btn" href="/download/trades">↓ Trades CSV</a><a class="btn" href="/download/features">↓ Entry features CSV</a><a class="btn" href="/download/decisions">↓ Decisions CSV</a><a class="btn" href="/api/status">API status</a></div></div></div></body></html>'''
+repair_decisions_file()
+
 app=Flask(__name__)
-def recent(n=30): return _read_csv_records(TRADES_FILE,n)
+def recent(n=30):
+    rows=_read_csv_records(TRADES_FILE,n)
+    for t in rows:
+        try:
+            risk=abs(float(t.get('gross_pnl_eur',0))/float(t.get('raw_R',0))) if float(t.get('raw_R',0)) else 0
+            costs=float(t.get('fees_eur',0) or 0)+float(t.get('slippage_eur',0) or 0)
+            t['costs_eur']=costs
+            t['costs_R']=costs/risk if risk else 0
+        except Exception:
+            t['costs_eur']=0;t['costs_R']=0
+    return rows
 @app.get('/')
 def dashboard():
     st=load_state(); c=load_candles(); r=regime_snapshot(c); price=float(c.close.iloc[-1]) if len(c) else 0
     return render_template_string(DASH,s=stats(st),r=r,strat=strategy_dashboard(st),openpos=open_positions_dashboard(st,price),decisions=_read_csv_records(DECISIONS_FILE,36),regimes=regime_performance(),recent=recent(),maxrisk=MAX_TOTAL_RISK*100)
 @app.get('/api/status')
 def status():
-    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.2','stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
+    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.3','stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
 def dl(path,name):
     if not os.path.exists(path):return {'error':'Nog geen bestand.'},404
     return send_file(path,mimetype='text/csv',as_attachment=True,download_name=name)
@@ -392,7 +444,7 @@ def d2():return dl(FEATURES_FILE,'btc_v1_entry_features.csv')
 @app.get('/download/decisions')
 def d3():return dl(DECISIONS_FILE,'btc_v1_decisions.csv')
 @app.get('/health')
-def health():return {'status':'ok','version':'BTC-V1.2'},200
+def health():return {'status':'ok','version':'BTC-V1.3'},200
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),threaded=True,use_reloader=False)
 
 def main():
@@ -421,10 +473,10 @@ def main():
                                 decision='BLOCK_ALREADY_OPEN'; s['blocked']+=1
                             elif cfg['enabled'] and sig.get('allowed') and is_cooldown(s):
                                 decision='BLOCK_COOLDOWN'; s['blocked']+=1
-                            append_csv(DECISIONS_FILE,{**sig['features'],'decision':decision,'router_reason':sig.get('router_reason'),'open_risk_pct':100*open_risk(state)})
+                            append_decision({**sig['features'],'decision':decision,'router_reason':sig.get('router_reason'),'open_risk_pct':100*open_risk(state)})
                         else:
                             # Diagnostic heartbeat: every confirmed 5m scan now records why each engine did not fire.
-                            append_csv(DECISIONS_FILE,{**sig['features'],'decision':'NO_SETUP','router_reason':'NOT_EVALUATED_NO_SIGNAL','open_risk_pct':100*open_risk(state)})
+                            append_decision({**sig['features'],'decision':'NO_SETUP','router_reason':'NOT_EVALUATED_NO_SIGNAL','open_risk_pct':100*open_risk(state)})
                 save_state(state);print(f"[STATUS] BTC={candles.close.iloc[-1]:,.0f} regime={snap.get('regime')} balance=€{state['balance']:.2f} trades={state['total_trades']}",flush=True)
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:save_state(state);break
