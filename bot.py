@@ -1,11 +1,11 @@
-import os, json, time, threading
+import os, json, time, threading, csv, hashlib
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, send_file
 import requests
 import pandas as pd
 import numpy as np
 
-# BTC V1.4 — scored entries + active continuation/retests + profit protection
+# BTC V1.6 PRO — professional measurement baseline
 INST_ID = os.getenv('INST_ID', 'BTC-USDT')
 START_BALANCE = float(os.getenv('START_BALANCE', '500'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
@@ -16,13 +16,17 @@ BOOTSTRAP_DAYS = int(os.getenv('BOOTSTRAP_DAYS', '90'))
 MAX_TOTAL_RISK = float(os.getenv('MAX_TOTAL_RISK', '0.01'))
 COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_HOURS = 8
-MIN_SCORE=5.0
-MAX_COST_R=0.30
-BE_TRIGGER_R=0.85
-LOCK_TRIGGER_R=1.20
-LOCK_PROFIT_R=0.55
-TRAIL_TRIGGER_R=1.65
-TRAIL_GAP_R=0.75
+MIN_SCORE = float(os.getenv('MIN_SCORE','65'))
+MAX_COST_R = float(os.getenv('MAX_COST_R','0.35'))
+DAILY_LOSS_LIMIT = float(os.getenv('DAILY_LOSS_LIMIT','0.03'))
+DRAWDOWN_SOFT = float(os.getenv('DRAWDOWN_SOFT','0.06'))
+DRAWDOWN_HARD = float(os.getenv('DRAWDOWN_HARD','0.09'))
+GLOBAL_CONSEC_LOSS_LIMIT = int(os.getenv('GLOBAL_CONSEC_LOSS_LIMIT','4'))
+BE_TRIGGER_R = float(os.getenv('BE_TRIGGER_R','1.00'))
+LOCK_TRIGGER_R = float(os.getenv('LOCK_TRIGGER_R','1.25'))
+LOCK_PROFIT_R = float(os.getenv('LOCK_PROFIT_R','0.60'))
+TRAIL_TRIGGER_R = float(os.getenv('TRAIL_TRIGGER_R','1.75'))
+TRAIL_GAP_R = float(os.getenv('TRAIL_GAP_R','0.85'))
 OKX_URL = os.getenv('OKX_PUBLIC_BASE', 'https://www.okx.com')
 HISTORY_ENDPOINT = '/api/v5/market/history-candles'
 LIVE_ENDPOINT = '/api/v5/market/candles'
@@ -30,23 +34,23 @@ DATA_DIR = os.getenv('DATA_DIR', '/data')
 try: os.makedirs(DATA_DIR, exist_ok=True)
 except PermissionError:
     DATA_DIR = './data'; os.makedirs(DATA_DIR, exist_ok=True)
-STATE_FILE = os.path.join(DATA_DIR, 'btc_v1_state.json')
-TRADES_FILE = os.path.join(DATA_DIR, 'btc_v1_trades.csv')
-FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v1_entry_features.csv')
-DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v1_decisions.csv')
-CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v1_candles_5m.csv')
+STATE_FILE = os.path.join(DATA_DIR, 'btc_v16_state.json')
+TRADES_FILE = os.path.join(DATA_DIR, 'btc_v16_trades.csv')
+FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v16_entries.csv')
+DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v16_decisions.csv')
+CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v16_candles_5m.csv')
 
 STRATEGIES = {
- 'SMC_SWEEP': {'label':'SMC Liquidity Sweep','rr':2.5,'stop_atr':1.35,'max_hours':6,'enabled':True},
- 'EMA_SCALP': {'label':'EMA Scalp','rr':1.8,'stop_atr':1.15,'max_hours':3,'enabled':True},
- 'MOMENTUM': {'label':'Momentum Continuation','rr':2.0,'stop_atr':1.30,'max_hours':4,'enabled':True},
- 'BREAKOUT': {'label':'Confirmed Breakout','rr':2.4,'stop_atr':1.65,'max_hours':8,'enabled':True},
- # Rebuilt, but kept shadow-only until it proves an edge in the new feature log.
- 'TREND_PULLBACK': {'label':'Trend Pullback 2.0','rr':2.4,'stop_atr':1.55,'max_hours':8,'enabled':False},
- 'MEAN_REVERSION': {'label':'Mean Reversion 2.0','rr':1.6,'stop_atr':1.35,'max_hours':4,'enabled':False},
+ 'SMC_SWEEP': {'label':'Liquidity Sweep / Reversal','rr':2.5,'stop_atr':1.35,'max_hours':6,'enabled':True},
+ 'EMA_SCALP': {'label':'Trend Pullback / EMA Retest','rr':2.0,'stop_atr':1.25,'max_hours':4,'enabled':True},
+ 'MOMENTUM': {'label':'Momentum Expansion','rr':2.2,'stop_atr':1.40,'max_hours':5,'enabled':True},
+ 'BREAKOUT': {'label':'Breakout / Retest','rr':2.5,'stop_atr':1.70,'max_hours':8,'enabled':True},
+ 'TREND_PULLBACK': {'label':'HTF Trend Continuation','rr':2.5,'stop_atr':1.65,'max_hours':8,'enabled':False},
+ 'MEAN_REVERSION': {'label':'Range Mean Reversion','rr':1.8,'stop_atr':1.45,'max_hours':5,'enabled':False},
 }
 
-session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.4'})
+
+session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.6-PRO'})
 state_lock=threading.RLock()
 def utc_now(): return datetime.now(timezone.utc)
 def finite(x):
@@ -56,7 +60,7 @@ def finite(x):
 def strategy_default():
     return {'position':None,'loss_streak':0,'cooldown_until':None,'scans':0,'signals':0,'blocked':0,'last_signal':'—','last_signal_time':None}
 def default_state():
-    return {'version':'BTC-V1.4','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'strategies':{k:strategy_default() for k in STRATEGIES}}
+    return {'version':'BTC-V1.6-PRO','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
 def normalize_state(s):
     base=default_state()
     for k,v in base.items(): s.setdefault(k,v)
@@ -137,193 +141,326 @@ def frames(c):
     d5=enrich(c.set_index('timestamp')); d15=enrich(closed_resample(c,'15min')); d1=enrich(closed_resample(c,'1h')); d4=enrich(closed_resample(c,'4h')); return d5,d15,d1,d4
 
 def regime_snapshot(c):
+    """Orthogonal regime dimensions: direction, strength, volatility and market state."""
     try:
         d5,d15,d1,d4=frames(c)
-        if min(len(d1),len(d4))<200:return {'regime':'WARMUP','direction':'MIXED'}
+        if min(len(d1),len(d4))<200:return {'regime':'WARMUP','direction':'NEUTRAL','strength':'WEAK','volatility':'UNKNOWN','market_state':'WARMUP'}
+        d1=d1.copy()
         d1['er24']=(d1.close-d1.close.shift(24)).abs()/d1.close.diff().abs().rolling(24).sum().replace(0,np.nan)
-        d1['atr_pct']=d1.atr/d1.close; d1['atr_med30d']=d1.atr_pct.rolling(24*30,min_periods=24*20).median(); d1['vol_ratio']=d1.atr_pct/d1.atr_med30d.replace(0,np.nan)
-        a=d1.iloc[-1]; b=d4.iloc[-1]
-        bull=a.ema20>a.ema50 and a.ema20_slope3>0 and b.ema20>b.ema50 and b.ema20_slope3>0
-        bear=a.ema20<a.ema50 and a.ema20_slope3<0 and b.ema20<b.ema50 and b.ema20_slope3<0
-        direction='BULL' if bull else 'BEAR' if bear else 'MIXED'; vr=float(a.vol_ratio) if finite(a.vol_ratio) else None; er=float(a.er24) if finite(a.er24) else None; ax=float(a.adx) if finite(a.adx) else None
-        low=vr is not None and er is not None and ax is not None and vr<.90 and ax<20 and er<.18
-        expansion=vr is not None and er is not None and ax is not None and vr>=1.15 and ax>=23 and er>=.22
-        regime=('BULL_EXPANSION' if bull and expansion else 'BEAR_EXPANSION' if bear and expansion else 'CHOP_LOWVOL' if low else 'TRANSITION')
-        return {'regime':regime,'direction':direction,'adx':ax,'er24':er,'vol_ratio':vr,'ema20_slope3_1h':float(a.ema20_slope3),'ema20_slope3_4h':float(b.ema20_slope3),'price':float(d5.close.iloc[-1])}
+        d1['atr_pct']=d1.atr/d1.close
+        d1['atr_med30d']=d1.atr_pct.rolling(24*30,min_periods=24*20).median()
+        d1['vol_ratio']=d1.atr_pct/d1.atr_med30d.replace(0,np.nan)
+        x=d1.iloc[-1]; h=d4.iloc[-1]
+        ax=float(x.adx) if finite(x.adx) else 0.0
+        er=float(x.er24) if finite(x.er24) else 0.0
+        vr=float(x.vol_ratio) if finite(x.vol_ratio) else 1.0
+        # Direction does not require perfect 1H+4H agreement anymore.
+        bull_pts=int(x.ema20>x.ema50)+int(x.ema20_slope3>0)+int(h.ema20>h.ema50)+int(h.ema20_slope3>0)
+        bear_pts=int(x.ema20<x.ema50)+int(x.ema20_slope3<0)+int(h.ema20<h.ema50)+int(h.ema20_slope3<0)
+        direction='BULL' if bull_pts>=3 and bull_pts>bear_pts else 'BEAR' if bear_pts>=3 and bear_pts>bull_pts else 'NEUTRAL'
+        strength='STRONG' if ax>=25 and er>=.22 else 'MEDIUM' if ax>=18 and er>=.10 else 'WEAK'
+        volatility='HIGH' if vr>=1.25 else 'LOW' if vr<=.80 else 'NORMAL'
+        expansion=(ax>=22 and er>=.18 and vr>=1.05)
+        range_like=(ax<18 and er<.10)
+        contraction=(vr<.85 and ax<20)
+        if expansion: market_state='EXPANSION'
+        elif range_like: market_state='RANGE_CHOP'
+        elif contraction: market_state='CONTRACTION'
+        elif direction!='NEUTRAL' and strength in {'MEDIUM','STRONG'}: market_state='TREND'
+        else: market_state='TRANSITION'
+        regime=f"{direction}_{strength}_{volatility}_{market_state}"
+        return {'regime':regime,'direction':direction,'strength':strength,'volatility':volatility,'market_state':market_state,
+                'adx':ax,'er24':er,'vol_ratio':vr,'ema20_slope3_1h':float(x.ema20_slope3),
+                'ema20_slope3_4h':float(h.ema20_slope3),'price':float(d5.close.iloc[-1])}
     except Exception as e:
-        print('[WARN] regime',repr(e),flush=True); return {'regime':'WARMUP','direction':'MIXED'}
+        print('[WARN] regime',repr(e),flush=True)
+        return {'regime':'WARMUP','direction':'NEUTRAL','strength':'WEAK','volatility':'UNKNOWN','market_state':'WARMUP'}
 
 def router(key,side,snap):
-    r=snap.get('regime'); direction=snap.get('direction'); ad=snap.get('adx') or 0
-    if r=='WARMUP': return False,'REGIME_WARMUP'
-    if r=='CHOP_LOWVOL': return False,'LOW_VOL_CHOP'
-    if key=='MEAN_REVERSION': return False,'SHADOW_REBUILD'
-    if key in {'MOMENTUM','BREAKOUT','TREND_PULLBACK'}:
-        hostile=(direction=='BULL' and side=='SHORT' and ad>=25) or (direction=='BEAR' and side=='LONG' and ad>=25)
-        if hostile:return False,'HOSTILE_HTF_CONTEXT'
-    return True,'SCORE_CONTEXT'
+    state=snap.get('market_state'); direction=snap.get('direction'); strength=snap.get('strength')
+    if state=='WARMUP': return False,'REGIME_WARMUP'
+    if key in {'BREAKOUT','MOMENTUM'} and state in {'RANGE_CHOP','CONTRACTION'}: return False,'WRONG_REGIME_TREND_ENGINE'
+    if key in {'EMA_SCALP','TREND_PULLBACK'} and state=='RANGE_CHOP': return False,'WRONG_REGIME_CONTINUATION'
+    if key=='SMC_SWEEP' and state=='EXPANSION' and strength=='STRONG': return False,'NO_FADE_STRONG_EXPANSION'
+    if key=='MEAN_REVERSION':
+        if state!='RANGE_CHOP': return False,'MEAN_REVERSION_RANGE_ONLY'
+    if direction=='BULL' and side=='SHORT' and strength=='STRONG': return False,'HOSTILE_HTF_DIRECTION'
+    if direction=='BEAR' and side=='LONG' and strength=='STRONG': return False,'HOSTILE_HTF_DIRECTION'
+    return True,'CONTEXT_OK'
 
-def features(key,side,reason,d5,d15,d1,d4,snap):
-    c5,c15,c1,c4=d5.iloc[-1],d15.iloc[-1],d1.iloc[-1],d4.iloc[-1]
-    return {'time':d5.index[-1].isoformat(),'strategy':key,'side':side or 'NONE','setup':reason,'regime':snap.get('regime'),'direction':snap.get('direction'),'price':float(c5.close),'rsi_5m':float(c5.rsi) if finite(c5.rsi) else None,'adx_1h':snap.get('adx'),'er24_1h':snap.get('er24'),'vol_ratio_1h':snap.get('vol_ratio'),'atr_pct_5m':float(c5.atr/c5.close) if finite(c5.atr) else None,'body_atr_5m':float(c5.body_atr) if finite(c5.body_atr) else None,'volume_ratio_5m':float(c5.volume_ratio) if finite(c5.volume_ratio) else None,'volume_ratio_15m':float(c15.volume_ratio) if finite(c15.volume_ratio) else None,'ema20_slope3_15m':float(c15.ema20_slope3) if finite(c15.ema20_slope3) else None,'ema20_slope3_1h':float(c1.ema20_slope3) if finite(c1.ema20_slope3) else None,'ema20_slope3_4h':float(c4.ema20_slope3) if finite(c4.ema20_slope3) else None}
-DECISION_COLUMNS=[
-    'time','strategy','side','setup','regime','direction','price','rsi_5m','adx_1h','er24_1h',
-    'vol_ratio_1h','atr_pct_5m','body_atr_5m','volume_ratio_5m','volume_ratio_15m',
-    'ema20_slope3_15m','ema20_slope3_1h','ema20_slope3_4h',
-    'quality_score','estimated_cost_R','router_allowed','router_reason','decision','open_risk_pct'
-]
+def base_features(key,side,setup,d5,d15,d1,d4,snap):
+    c5,c15=d5.iloc[-1],d15.iloc[-1]
+    return {'time':d5.index[-1].isoformat(),'strategy':key,'side':side or 'NONE','setup':setup,
+            'regime':snap.get('regime'),'direction':snap.get('direction'),'strength':snap.get('strength'),
+            'volatility':snap.get('volatility'),'market_state':snap.get('market_state'),'price':float(c5.close),
+            'rsi_5m':float(c5.rsi) if finite(c5.rsi) else None,'adx_1h':snap.get('adx'),'er24_1h':snap.get('er24'),
+            'vol_ratio_1h':snap.get('vol_ratio'),'atr_pct_5m':float(c5.atr/c5.close) if finite(c5.atr) else None,
+            'body_atr_5m':float(c5.body_atr) if finite(c5.body_atr) else None,
+            'volume_ratio_5m':float(c5.volume_ratio) if finite(c5.volume_ratio) else None,
+            'volume_ratio_15m':float(c15.volume_ratio) if finite(c15.volume_ratio) else None,
+            'ema20_slope3_15m':float(c15.ema20_slope3) if finite(c15.ema20_slope3) else None,
+            'ema20_slope3_1h':snap.get('ema20_slope3_1h'),'ema20_slope3_4h':snap.get('ema20_slope3_4h')}
 
-def append_csv(path,row):
-    exists=os.path.exists(path)
-    pd.DataFrame([row]).to_csv(path,mode='a' if exists else 'w',header=not exists,index=False)
+def score_setup(key,side,trigger,ctx,snap):
+    """Transparent 0-100 score. Components are logged; weights are hypotheses, not fitted to the 8 legacy trades."""
+    direction=snap.get('direction'); strength=snap.get('strength'); state=snap.get('market_state')
+    trend=20 if direction==side.replace('LONG','BULL').replace('SHORT','BEAR') else 10 if direction=='NEUTRAL' else 2
+    regime=20 if ((key in {'BREAKOUT','MOMENTUM'} and state in {'EXPANSION','TREND'}) or
+                  (key in {'EMA_SCALP','TREND_PULLBACK'} and state in {'TREND','TRANSITION','EXPANSION'}) or
+                  (key=='SMC_SWEEP' and state in {'TRANSITION','RANGE_CHOP','CONTRACTION'}) or
+                  (key=='MEAN_REVERSION' and state=='RANGE_CHOP')) else 7
+    trigger_score=min(25,max(0,float(trigger)))
+    momentum=min(15,max(0,float(ctx.get('momentum',7))))
+    volume=min(10,max(0,float(ctx.get('volume',5))))
+    structure=min(10,max(0,float(ctx.get('structure',5))))
+    total=trend+regime+trigger_score+momentum+volume+structure
+    return {'score_total':float(total),'score_trend':float(trend),'score_regime':float(regime),
+            'score_trigger':float(trigger_score),'score_momentum':float(momentum),
+            'score_volume':float(volume),'score_structure':float(structure)}
 
-def normalize_decision(row):
-    # One immutable schema for NO_SETUP / OPEN / SHADOW / every BLOCK state.
-    clean={k:None for k in DECISION_COLUMNS}
-    for k in DECISION_COLUMNS:
-        if k in row: clean[k]=row.get(k)
-    return clean
+def detect_smc(d5,d15,d1,d4,snap):
+    c,p=d5.iloc[-1],d5.iloc[-2]; hi=d5.high.shift(1).rolling(18).max().iloc[-1]; lo=d5.low.shift(1).rolling(18).min().iloc[-1]
+    if c.low<lo and c.close>lo and c.close>c.open:
+        depth=(lo-c.low)/c.atr if c.atr else 0; return 'LONG','LOW_SWEEP_RECLAIM',max(float(c.atr*1.35),float(c.close-c.low)),20+min(5,depth*10)
+    if c.high>hi and c.close<hi and c.close<c.open:
+        depth=(c.high-hi)/c.atr if c.atr else 0; return 'SHORT','HIGH_SWEEP_REJECT',max(float(c.atr*1.35),float(c.high-c.close)),20+min(5,depth*10)
+    return None,'WAIT_LIQUIDITY_SWEEP',None,0
 
-def append_decision(row):
-    clean=normalize_decision(row)
-    exists=os.path.exists(DECISIONS_FILE) and os.path.getsize(DECISIONS_FILE)>0
-    pd.DataFrame([clean],columns=DECISION_COLUMNS).to_csv(
-        DECISIONS_FILE,mode='a' if exists else 'w',header=not exists,index=False
-    )
+def detect_ema(d5,d15,d1,d4,snap):
+    c,p=d5.iloc[-1],d5.iloc[-2]
+    long_retest=p.low<=p.ema21*1.0015 and c.close>c.ema9>c.ema21 and c.close>p.close
+    short_retest=p.high>=p.ema21*.9985 and c.close<c.ema9<c.ema21 and c.close<p.close
+    if long_retest and c.rsi>=48:return 'LONG','EMA_PULLBACK_RECLAIM',float(c.atr*1.25),22
+    if short_retest and c.rsi<=52:return 'SHORT','EMA_PULLBACK_REJECT',float(c.atr*1.25),22
+    return None,'WAIT_EMA_RETEST',None,0
 
-def repair_decisions_file():
-    """Rotate an old malformed decisions CSV instead of silently losing it."""
-    if not os.path.exists(DECISIONS_FILE) or os.path.getsize(DECISIONS_FILE)==0:return
-    bad=False
-    try:
-        with open(DECISIONS_FILE,newline='',encoding='utf-8') as f:
-            rows=list(csv.reader(f))
-        if not rows:return
-        if rows[0] != DECISION_COLUMNS: bad=True
-        elif any(len(r)!=len(DECISION_COLUMNS) for r in rows[1:]): bad=True
-    except Exception:
-        bad=True
-    if bad:
-        stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-        backup=DECISIONS_FILE.replace('.csv',f'_legacy_{stamp}.csv')
-        os.replace(DECISIONS_FILE,backup)
-        print(f'[MIGRATION] malformed decisions CSV rotated to {backup}',flush=True)
+def detect_momentum(d5,d15,d1,d4,snap):
+    c,p=d5.iloc[-1],d5.iloc[-2]; recent=d5.iloc[-7:-1]
+    up=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi>=54)).any())
+    dn=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi<=46)).any())
+    if up and c.close>c.ema9 and c.close>p.close and c.rsi>=51:return 'LONG','IMPULSE_CONTINUATION',float(c.atr*1.40),21
+    if dn and c.close<c.ema9 and c.close<p.close and c.rsi<=49:return 'SHORT','IMPULSE_CONTINUATION',float(c.atr*1.40),21
+    return None,'WAIT_MOMENTUM',None,0
+
+def detect_breakout(d5,d15,d1,d4,snap):
+    c,p=d15.iloc[-1],d15.iloc[-2]; hi=d15.high.shift(2).rolling(8).max().iloc[-1]; lo=d15.low.shift(2).rolling(8).min().iloc[-1]
+    long_retest=p.close>hi and c.low<=hi*1.002 and c.close>hi
+    short_retest=p.close<lo and c.high>=lo*.998 and c.close<lo
+    if long_retest:return 'LONG','BREAKOUT_RETEST_ACCEPT',float(c.atr*1.70),24
+    if short_retest:return 'SHORT','BREAKOUT_RETEST_ACCEPT',float(c.atr*1.70),24
+    return None,'WAIT_BREAKOUT_RETEST',None,0
+
+def detect_trend_pullback(d5,d15,d1,d4,snap):
+    c,p=d15.iloc[-1],d15.iloc[-2]; h=d1.iloc[-1]
+    bull=h.ema20>h.ema50 and h.ema20_slope3>0 and h.adx>=18
+    bear=h.ema20<h.ema50 and h.ema20_slope3<0 and h.adx>=18
+    if bull and p.low<=p.ema20*1.003 and c.close>c.ema20 and c.close>p.close:return 'LONG','HTF_PULLBACK_RESUME',float(c.atr*1.65),23
+    if bear and p.high>=p.ema20*.997 and c.close<c.ema20 and c.close<p.close:return 'SHORT','HTF_PULLBACK_RESUME',float(c.atr*1.65),23
+    return None,'WAIT_HTF_PULLBACK',None,0
+
+def detect_mean_reversion(d5,d15,d1,d4,snap):
+    c=d5.iloc[-1]; z=(c.close-c.ema20)/c.atr if c.atr else 0
+    if z<-1.7 and c.rsi<32 and c.close>c.open:return 'LONG','RANGE_EXTREME_SNAPBACK',float(c.atr*1.45),22
+    if z>1.7 and c.rsi>68 and c.close<c.open:return 'SHORT','RANGE_EXTREME_SNAPBACK',float(c.atr*1.45),22
+    return None,'WAIT_RANGE_EXTREME',None,0
+
+DETECTORS={'SMC_SWEEP':detect_smc,'EMA_SCALP':detect_ema,'MOMENTUM':detect_momentum,
+           'BREAKOUT':detect_breakout,'TREND_PULLBACK':detect_trend_pullback,'MEAN_REVERSION':detect_mean_reversion}
+
+DECISION_COLUMNS=['schema_version','candidate_id','time','strategy','side','setup','regime','direction','strength','volatility','market_state',
+ 'price','rsi_5m','adx_1h','er24_1h','vol_ratio_1h','atr_pct_5m','body_atr_5m','volume_ratio_5m','volume_ratio_15m',
+ 'ema20_slope3_15m','ema20_slope3_1h','ema20_slope3_4h','score_total','score_trend','score_regime','score_trigger',
+ 'score_momentum','score_volume','score_structure','estimated_cost_R','initial_rr','router_allowed','router_reason','decision','open_risk_pct']
+ENTRY_COLUMNS=DECISION_COLUMNS+['entry','initial_stop','initial_target','stop_distance','stop_pct','risk_eur','qty','notional']
+TRADE_COLUMNS=['schema_version','candidate_id','strategy','entry_time','exit_time','side','setup','regime','score_total','entry','exit',
+ 'initial_stop','final_stop','target','raw_R','net_R','reason','gross_pnl_eur','fees_eur','slippage_eur','pnl_eur','balance',
+ 'MFE_R','MAE_R','giveback_R','bars_held']
+EVENT_COLUMNS=['schema_version','candidate_id','time','strategy','event','price','r_value','old_stop','new_stop','detail']
+SHADOW_COLUMNS=['schema_version','candidate_id','strategy','side','setup','decision','block_reason','entry_time','finish_time','entry',
+ 'stop','target','MFE_R','MAE_R','first_touch','bars','regime','score_total']
+
+EVENTS_FILE=os.path.join(DATA_DIR,'btc_v16_management_events.csv')
+SHADOW_FILE=os.path.join(DATA_DIR,'btc_v16_shadow_outcomes.csv')
+
+def append_fixed(path,row,columns):
+    clean={k:row.get(k) for k in columns}
+    exists=os.path.exists(path) and os.path.getsize(path)>0
+    pd.DataFrame([clean],columns=columns).to_csv(path,mode='a' if exists else 'w',header=not exists,index=False)
+
+def append_decision(row): append_fixed(DECISIONS_FILE,row,DECISION_COLUMNS)
+def append_entry(row): append_fixed(FEATURES_FILE,row,ENTRY_COLUMNS)
+def log_event(row): append_fixed(EVENTS_FILE,row,EVENT_COLUMNS)
+
+def candidate_id(key,t,side,setup):
+    raw=f"{key}|{pd.Timestamp(t).isoformat()}|{side}|{setup}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 def signal_for(key,c,snap):
     if len(c)<600:return None
     d5,d15,d1,d4=frames(c)
     if min(len(d15),len(d1),len(d4))<200:return None
-    t=d5.index[-1]; c5,p5=d5.iloc[-1],d5.iloc[-2]; c15,p15=d15.iloc[-1],d15.iloc[-2]; c1=d1.iloc[-1]; c4=d4.iloc[-1]
-    side=None;note='NO_SETUP';dist=None;score=0.0
-    if key=='SMC_SWEEP':
-        hi=d5.high.shift(1).rolling(18).max().iloc[-1];lo=d5.low.shift(1).rolling(18).min().iloc[-1]
-        sl=c5.low<lo;sh=c5.high>hi
-        if sl and c5.close>lo and c5.close>c5.open:
-            side,note='LONG','LOW_SWEEP_RECLAIM';score=2+(c5.body_atr>=.25)+(c5.volume_ratio>=1)+(c5.rsi>=p5.rsi)+(snap.get('direction') in {'BULL','MIXED'})
-        elif sh and c5.close<hi and c5.close<c5.open:
-            side,note='SHORT','HIGH_SWEEP_REJECT';score=2+(c5.body_atr>=.25)+(c5.volume_ratio>=1)+(c5.rsi<=p5.rsi)+(snap.get('direction') in {'BEAR','MIXED'})
-        else:note='WAIT_LIQUIDITY_SWEEP'
-        if side:dist=max(float(c5.atr*STRATEGIES[key]['stop_atr']),abs(float(c5.close-c5.low)) if side=='LONG' else abs(float(c5.high-c5.close)))
-    elif key=='EMA_SCALP':
-        cu=((d5.ema9.shift(1)<=d5.ema21.shift(1))&(d5.ema9>d5.ema21)).tail(4).any();cd=((d5.ema9.shift(1)>=d5.ema21.shift(1))&(d5.ema9<d5.ema21)).tail(4).any()
-        pu=p5.low<=p5.ema21*1.0015 and c5.close>c5.ema9 and c5.ema9>c5.ema21 and c5.close>p5.close
-        pdn=p5.high>=p5.ema21*.9985 and c5.close<c5.ema9 and c5.ema9<c5.ema21 and c5.close<p5.close
-        tu=c15.ema20>c15.ema50 and c15.ema20_slope3>0;td=c15.ema20<c15.ema50 and c15.ema20_slope3<0
-        if (cu or pu) and c5.rsi>=48:
-            side,note='LONG','EMA_CROSS' if cu else 'EMA_PULLBACK_RECLAIM';score=2+tu+(c5.volume_ratio>=.75)+(c5.rsi>=52)+(snap.get('direction')=='BULL')
-        elif (cd or pdn) and c5.rsi<=52:
-            side,note='SHORT','EMA_CROSS' if cd else 'EMA_PULLBACK_REJECT';score=2+td+(c5.volume_ratio>=.75)+(c5.rsi<=48)+(snap.get('direction')=='BEAR')
-        else:note='WAIT_EMA_CROSS_OR_RETEST'
-        if side:dist=float(c5.atr*STRATEGIES[key]['stop_atr'])
-    elif key=='MOMENTUM':
-        r=d5.iloc[-7:-1];up=bool(((r.body_atr>=.40)&(r.volume_ratio>=.95)&(r.rsi>=54)).any());dn=bool(((r.body_atr>=.40)&(r.volume_ratio>=.95)&(r.rsi<=46)).any())
-        tu=c15.ema20>c15.ema50 or c15.ema20_slope3>0;td=c15.ema20<c15.ema50 or c15.ema20_slope3<0
-        if up and c5.close>c5.ema9 and c5.close>p5.close and c5.rsi>=51:
-            side,note='LONG','IMPULSE_RETRACE_CONTINUATION';score=2+tu+(c5.volume_ratio>=.70)+(c5.rsi>=55)+(snap.get('direction')=='BULL')
-        elif dn and c5.close<c5.ema9 and c5.close<p5.close and c5.rsi<=49:
-            side,note='SHORT','IMPULSE_RETRACE_CONTINUATION';score=2+td+(c5.volume_ratio>=.70)+(c5.rsi<=45)+(snap.get('direction')=='BEAR')
-        else:note='WAIT_MOMENTUM_CONTINUATION' if(up or dn) else 'WAIT_MOMENTUM_IMPULSE'
-        if side:dist=float(c5.atr*STRATEGIES[key]['stop_atr'])
-    elif key=='BREAKOUT':
-        hi=d15.high.shift(1).rolling(8).max().iloc[-1];lo=d15.low.shift(1).rolling(8).min().iloc[-1]
-        rh=d15.high.shift(2).rolling(8).max().iloc[-1];rl=d15.low.shift(2).rolling(8).min().iloc[-1]
-        bu=c15.close>hi;bd=c15.close<lo;ru=p15.close>rh and c15.low<=rh*1.002 and c15.close>rh;rd=p15.close<rl and c15.high>=rl*.998 and c15.close<rl
-        tu=c1.ema20>c1.ema50 or c1.ema20_slope3>0;td=c1.ema20<c1.ema50 or c1.ema20_slope3<0
-        if bu or ru:
-            side,note='LONG','15M_BREAKOUT' if bu else 'BREAKOUT_RETEST';score=2+tu+(c15.volume_ratio>=.85)+(c15.body_atr>=.20)+(snap.get('direction')=='BULL')
-        elif bd or rd:
-            side,note='SHORT','15M_BREAKOUT' if bd else 'BREAKOUT_RETEST';score=2+td+(c15.volume_ratio>=.85)+(c15.body_atr>=.20)+(snap.get('direction')=='BEAR')
-        else:note='WAIT_BREAKOUT_OR_RETEST'
-        if side:dist=float(c15.atr*STRATEGIES[key]['stop_atr'])
-    elif key=='TREND_PULLBACK':
-        bull=c1.ema20>c1.ema50 and c1.ema20_slope3>0 and c1.adx>=18;bear=c1.ema20<c1.ema50 and c1.ema20_slope3<0 and c1.adx>=18
-        if bull and p15.low<=p15.ema20*1.003 and c15.close>c15.ema20 and c15.close>p15.close:side,note='LONG','HTF_PULLBACK_RESUME';score=4+(c4.ema20>c4.ema50)+(c15.volume_ratio>=.70)
-        elif bear and p15.high>=p15.ema20*.997 and c15.close<c15.ema20 and c15.close<p15.close:side,note='SHORT','HTF_PULLBACK_RESUME';score=4+(c4.ema20<c4.ema50)+(c15.volume_ratio>=.70)
-        else:note='WAIT_PULLBACK_RESUME' if(bull or bear) else 'WAIT_HTF_TREND'
-        if side:dist=float(c15.atr*STRATEGIES[key]['stop_atr'])
-    elif key=='MEAN_REVERSION':
-        z=(c5.close-c5.ema20)/c5.atr if c5.atr else 0
-        if z<-1.6 and c5.rsi<34 and c5.close>c5.open:side,note='LONG','EXTREME_SNAPBACK';score=4+(c5.volume_ratio>=.70)
-        elif z>1.6 and c5.rsi>66 and c5.close<c5.open:side,note='SHORT','EXTREME_SNAPBACK';score=4+(c5.volume_ratio>=.70)
-        else:note='WAIT_PRICE_EXTREME'
-        if side:dist=float(c5.atr*STRATEGIES[key]['stop_atr'])
-    score=float(score);feat=features(key,side,note,d5,d15,d1,d4,snap);feat['quality_score']=score
-    if not side:return {'signal':None,'time':t,'reason':note,'features':feat}
-    est_cost_r=(float(c5.close)/dist)*2*(TAKER_FEE+SLIPPAGE_BPS/10000.0);feat['estimated_cost_R']=est_cost_r
+    side,setup,dist,trigger=DETECTORS[key](d5,d15,d1,d4,snap)
+    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='2.0'
+    if not side:return {'signal':None,'time':d5.index[-1],'reason':setup,'features':feat}
+    c5=d5.iloc[-1]
+    ctx={'momentum':15 if (side=='LONG' and c5.rsi>=55) or (side=='SHORT' and c5.rsi<=45) else 9,
+         'volume':10 if c5.volume_ratio>=1.10 else 7 if c5.volume_ratio>=.80 else 3,
+         'structure':10 if abs(float(c5.close-c5.ema20))/float(c5.atr or 1)<1.5 else 6}
+    scores=score_setup(key,side,trigger,ctx,snap); feat.update(scores)
+    cid=candidate_id(key,d5.index[-1],side,setup); feat['candidate_id']=cid
+    entry=float(c5.close); base_dist=float(dist)
+    # Cost-aware stop floor keeps risk fixed at 1% while avoiding economically absurd micro-stops.
+    roundtrip_rate=2*(TAKER_FEE+SLIPPAGE_BPS/10000.0)
+    min_dist=entry*roundtrip_rate/MAX_COST_R
+    dist=max(base_dist,min_dist)
+    est=(entry/dist)*roundtrip_rate
+    feat['estimated_cost_R']=est; feat['initial_rr']=STRATEGIES[key]['rr']
     allowed,why=router(key,side,snap)
-    if score<MIN_SCORE:allowed,why=False,'QUALITY_SCORE'
-    if est_cost_r>MAX_COST_R:allowed,why=False,'COST_TOO_HIGH'
+    if scores['score_total']<MIN_SCORE:allowed,why=False,'SCORE_BELOW_BASELINE'
     feat['router_allowed']=allowed;feat['router_reason']=why
-    return {'signal':side,'time':t,'entry':float(c5.close),'stop_distance':float(dist),'reason':note,'allowed':allowed,'router_reason':why,'features':feat,'score':score,'estimated_cost_R':est_cost_r}
+    return {'signal':side,'time':d5.index[-1],'entry':entry,'stop_distance':dist,'reason':setup,'allowed':allowed,
+            'router_reason':why,'features':feat,'score':scores['score_total'],'estimated_cost_R':est,'candidate_id':cid,'regime':snap.get('regime')}
+
+def start_shadow(state,sig,decision):
+    cid=sig['candidate_id']
+    if cid in state['shadow_candidates']:return
+    entry=sig['entry']; dist=sig['stop_distance']; side=sig['signal']; rr=STRATEGIES[sig['features']['strategy']]['rr']
+    state['shadow_candidates'][cid]={'candidate_id':cid,'strategy':sig['features']['strategy'],'side':side,'setup':sig['reason'],
+      'decision':decision,'block_reason':sig.get('router_reason'),'entry_time':sig['time'].isoformat(),'entry':entry,
+      'stop':entry-dist if side=='LONG' else entry+dist,'target':entry+rr*dist if side=='LONG' else entry-rr*dist,
+      'dist':dist,'MFE_R':0.0,'MAE_R':0.0,'first_touch':'NONE','bars':0,'regime':sig.get('regime'),'score_total':sig.get('score')}
+
+def update_shadows(state,bar):
+    done=[]
+    for cid,x in list(state.get('shadow_candidates',{}).items()):
+        if pd.Timestamp(bar.timestamp)<=pd.Timestamp(x['entry_time']):continue
+        h,l=float(bar.high),float(bar.low); x['bars']+=1
+        fav=(h-x['entry'])/x['dist'] if x['side']=='LONG' else (x['entry']-l)/x['dist']
+        adv=(l-x['entry'])/x['dist'] if x['side']=='LONG' else (x['entry']-h)/x['dist']
+        x['MFE_R']=max(x['MFE_R'],fav);x['MAE_R']=min(x['MAE_R'],adv)
+        stop_hit=l<=x['stop'] if x['side']=='LONG' else h>=x['stop']
+        tp_hit=h>=x['target'] if x['side']=='LONG' else l<=x['target']
+        if stop_hit and tp_hit:x['first_touch']='AMBIGUOUS'
+        elif stop_hit:x['first_touch']='STOP'
+        elif tp_hit:x['first_touch']='TARGET'
+        if x['first_touch']!='NONE' or x['bars']>=96:
+            if x['first_touch']=='NONE':x['first_touch']='TIME'
+            append_fixed(SHADOW_FILE,{**x,'schema_version':'2.0','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
+    for cid in done:state['shadow_candidates'].pop(cid,None)
 
 def is_cooldown(s,now=None):
     if not s.get('cooldown_until'):return False
     now=now or pd.Timestamp.now(tz='UTC'); until=pd.Timestamp(s['cooldown_until'])
     if now>=until:s['cooldown_until']=None;return False
     return True
-def open_risk(state): return sum(RISK_PER_TRADE for s in state['strategies'].values() if s.get('position'))
-def can_open(state): return open_risk(state)+RISK_PER_TRADE<=MAX_TOTAL_RISK+1e-12
+
+def open_risk(state): return sum(RISK_PER_TRADE for x in state['strategies'].values() if x.get('position'))
+
+def refresh_risk_day(state,now=None):
+    now=now or utc_now(); day=now.date().isoformat()
+    if state.get('risk_day')!=day:
+        state['risk_day']=day;state['day_start_balance']=state['balance'];state['global_loss_streak']=0
+
+def risk_permission(state):
+    refresh_risk_day(state)
+    if RISK_PER_TRADE>0.0100001:return False,'RISK_PER_TRADE_GT_1PCT'
+    if open_risk(state)+RISK_PER_TRADE>MAX_TOTAL_RISK+1e-12:return False,'TOTAL_EXPOSURE_CAP'
+    day_start=max(float(state.get('day_start_balance') or state['balance']),1e-9)
+    if state['balance']/day_start-1<=-DAILY_LOSS_LIMIT:return False,'DAILY_LOSS_LIMIT'
+    dd=state['balance']/max(state.get('peak_balance',state['balance']),1e-9)-1
+    if dd<=-DRAWDOWN_HARD:return False,'HARD_DRAWDOWN_MODE'
+    if state.get('global_loss_streak',0)>=GLOBAL_CONSEC_LOSS_LIMIT:return False,'GLOBAL_LOSS_STREAK'
+    return True,'RISK_OK'
+
+def effective_risk_pct(state):
+    dd=state['balance']/max(state.get('peak_balance',state['balance']),1e-9)-1
+    # Never above 1%; soft drawdown mode cuts risk rather than increasing it.
+    return min(RISK_PER_TRADE,0.005 if dd<=-DRAWDOWN_SOFT else RISK_PER_TRADE)
 
 def open_position(key,state,s,sig):
-    entry,dist,side=sig['entry'],sig['stop_distance'],sig['signal']; cfg=STRATEGIES[key]; stop=entry-dist if side=='LONG' else entry+dist; target=entry+cfg['rr']*dist if side=='LONG' else entry-cfg['rr']*dist
-    risk_eur=state['balance']*RISK_PER_TRADE; qty=risk_eur/dist; notional=qty*entry
-    s['position']={'side':side,'entry_time':sig['time'].isoformat(),'entry_price':entry,'stop':stop,'target':target,'stop_distance':dist,'risk_eur':risk_eur,'qty':qty,'notional':notional,'setup':sig['reason'],'mfe_r':0.0,'mae_r':0.0,'protected_stage':0,'quality_score':sig.get('score'),'estimated_cost_R':sig.get('estimated_cost_R')}
-    s['signals']+=1;s['last_signal']=f"{side} · {sig['reason']}";s['last_signal_time']=sig['time'].isoformat(); append_csv(FEATURES_FILE,{**sig['features'],'entry':entry,'stop':stop,'target':target,'stop_pct':dist/entry,'risk_eur':risk_eur,'notional':notional,'quality_score':sig.get('score'),'estimated_cost_R':sig.get('estimated_cost_R')})
-    print(f'[ENTRY][{key}] {side} {entry:.2f} stop={stop:.2f} tp={target:.2f}',flush=True)
+    entry,dist,side=sig['entry'],sig['stop_distance'],sig['signal'];cfg=STRATEGIES[key]
+    stop=entry-dist if side=='LONG' else entry+dist;target=entry+cfg['rr']*dist if side=='LONG' else entry-cfg['rr']*dist
+    risk_pct=effective_risk_pct(state);risk_eur=state['balance']*risk_pct;qty=risk_eur/dist;notional=qty*entry
+    p={'candidate_id':sig['candidate_id'],'side':side,'entry_time':sig['time'].isoformat(),'entry_price':entry,
+       'initial_stop':stop,'stop':stop,'target':target,'stop_distance':dist,'risk_eur':risk_eur,'risk_pct':risk_pct,
+       'qty':qty,'notional':notional,'setup':sig['reason'],'regime':sig.get('regime'),'mfe_r':0.0,'mae_r':0.0,
+       'protected_stage':0,'score_total':sig.get('score'),'estimated_cost_R':sig.get('estimated_cost_R'),'bars_held':0}
+    s['position']=p;s['signals']+=1;s['last_signal']=f"{side} · {sig['reason']}";s['last_signal_time']=sig['time'].isoformat()
+    append_entry({**sig['features'],'entry':entry,'initial_stop':stop,'initial_target':target,'stop_distance':dist,
+                  'stop_pct':dist/entry,'risk_eur':risk_eur,'qty':qty,'notional':notional})
+    log_event({'schema_version':'2.0','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
+               'price':entry,'r_value':0,'old_stop':stop,'new_stop':stop,'detail':f"risk_pct={risk_pct:.4f}"})
+    print(f'[ENTRY][{key}] {side} {entry:.2f} stop={stop:.2f} tp={target:.2f} score={sig.get("score"):.0f}',flush=True)
+
 def close_position(key,state,s,exit_price,exit_time,reason):
-    p=s['position']; raw_r=(exit_price-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-exit_price)/p['stop_distance']
-    gross=p['risk_eur']*raw_r; fee=(p['notional'] + p['qty']*exit_price)*TAKER_FEE; slip=(p['notional'] + p['qty']*exit_price)*(SLIPPAGE_BPS/10000.0); pnl=gross-fee-slip; net_r=pnl/p['risk_eur'] if p['risk_eur'] else 0
+    p=s['position'];raw_r=(exit_price-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-exit_price)/p['stop_distance']
+    gross=p['risk_eur']*raw_r;fee=(p['notional']+p['qty']*exit_price)*TAKER_FEE;slip=(p['notional']+p['qty']*exit_price)*(SLIPPAGE_BPS/10000.0)
+    pnl=gross-fee-slip;net_r=pnl/p['risk_eur'] if p['risk_eur'] else 0
     state['balance']+=pnl;state['peak_balance']=max(state['peak_balance'],state['balance']);state['max_drawdown']=min(state['max_drawdown'],state['balance']/state['peak_balance']-1);state['total_trades']+=1
-    if pnl>0:state['winning_trades']+=1;state['gross_profit']+=pnl;s['loss_streak']=0
+    if pnl>0:
+        state['winning_trades']+=1;state['gross_profit']+=pnl;s['loss_streak']=0;state['global_loss_streak']=0
     else:
-        state['losing_trades']+=1;state['gross_loss']+=abs(pnl);s['loss_streak']+=1
+        state['losing_trades']+=1;state['gross_loss']+=abs(pnl);s['loss_streak']+=1;state['global_loss_streak']=state.get('global_loss_streak',0)+1
         if s['loss_streak']>=COOLDOWN_AFTER_LOSSES:s['cooldown_until']=(exit_time+timedelta(hours=COOLDOWN_HOURS)).isoformat()
-    append_csv(TRADES_FILE,{'strategy':key,'entry_time':p['entry_time'],'exit_time':exit_time.isoformat(),'side':p['side'],'setup':p['setup'],'entry':p['entry_price'],'exit':exit_price,'stop':p['stop'],'target':p['target'],'raw_R':raw_r,'net_R':net_r,'reason':reason,'gross_pnl_eur':gross,'fees_eur':fee,'slippage_eur':slip,'pnl_eur':pnl,'balance':state['balance'],'MFE_R':p['mfe_r'],'MAE_R':p['mae_r']})
-    s['position']=None; print(f'[EXIT][{key}] {reason} rawR={raw_r:.2f} netR={net_r:.2f} pnl=€{pnl:+.2f}',flush=True)
+    giveback=max(0,float(p.get('mfe_r',0))-raw_r)
+    append_fixed(TRADES_FILE,{'schema_version':'2.0','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
+      'exit_time':exit_time.isoformat(),'side':p['side'],'setup':p['setup'],'regime':p.get('regime'),'score_total':p.get('score_total'),
+      'entry':p['entry_price'],'exit':exit_price,'initial_stop':p['initial_stop'],'final_stop':p['stop'],'target':p['target'],
+      'raw_R':raw_r,'net_R':net_r,'reason':reason,'gross_pnl_eur':gross,'fees_eur':fee,'slippage_eur':slip,'pnl_eur':pnl,
+      'balance':state['balance'],'MFE_R':p['mfe_r'],'MAE_R':p['mae_r'],'giveback_R':giveback,'bars_held':p.get('bars_held',0)},TRADE_COLUMNS)
+    log_event({'schema_version':'2.0','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
+               'price':exit_price,'r_value':raw_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':reason})
+    s['position']=None;print(f'[EXIT][{key}] {reason} rawR={raw_r:.2f} netR={net_r:.2f}',flush=True)
+
+def move_stop(key,p,t,new_stop,event,r_value):
+    old=p['stop']
+    if p['side']=='LONG':new_stop=max(old,new_stop)
+    else:new_stop=min(old,new_stop)
+    if abs(new_stop-old)>1e-9:
+        p['stop']=new_stop
+        log_event({'schema_version':'2.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
+                   'price':None,'r_value':r_value,'old_stop':old,'new_stop':new_stop,'detail':''})
+
 def check_position(key,state,s,candle):
     p=s.get('position')
     if not p:return
-    h,l,cl,t=float(candle.high),float(candle.low),float(candle.close),candle.timestamp
-    fav=(h-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-l)/p['stop_distance'];adv=(l-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-h)/p['stop_distance']
+    h,l,cl,t=float(candle.high),float(candle.low),float(candle.close),candle.timestamp;p['bars_held']=p.get('bars_held',0)+1
+    fav=(h-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-l)/p['stop_distance']
+    adv=(l-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-h)/p['stop_distance']
     p['mfe_r']=max(p.get('mfe_r',0),fav);p['mae_r']=min(p.get('mae_r',0),adv)
-    if p['side']=='LONG':
-        if l<=p['stop']:return close_position(key,state,s,p['stop'],t,'STOP' if p.get('protected_stage',0)==0 else 'PROTECTED_STOP')
-        if h>=p['target']:return close_position(key,state,s,p['target'],t,'TAKE_PROFIT')
-    else:
-        if h>=p['stop']:return close_position(key,state,s,p['stop'],t,'STOP' if p.get('protected_stage',0)==0 else 'PROTECTED_STOP')
-        if l<=p['target']:return close_position(key,state,s,p['target'],t,'TAKE_PROFIT')
-    cr=(cl-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-cl)/p['stop_distance'];stage=p.get('protected_stage',0)
-    if cr>=TRAIL_TRIGGER_R:
-        lock=max(LOCK_PROFIT_R,cr-TRAIL_GAP_R);p['stop']=p['entry_price']+lock*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-lock*p['stop_distance'];p['protected_stage']=3
-    elif cr>=LOCK_TRIGGER_R and stage<2:
-        p['stop']=p['entry_price']+LOCK_PROFIT_R*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-LOCK_PROFIT_R*p['stop_distance'];p['protected_stage']=2
-    elif cr>=BE_TRIGGER_R and stage<1:
-        cushion=min(.15,max(.05,(p.get('estimated_cost_R') or .10)*.5));p['stop']=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance'];p['protected_stage']=1
-    if t-pd.Timestamp(p['entry_time'])>=pd.Timedelta(hours=STRATEGIES[key]['max_hours']):close_position(key,state,s,cl,t,'TIME_EXIT')
+    stop_hit=l<=p['stop'] if p['side']=='LONG' else h>=p['stop'];tp_hit=h>=p['target'] if p['side']=='LONG' else l<=p['target']
+    if stop_hit and tp_hit:
+        log_event({'schema_version':'2.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
+                   'price':cl,'r_value':None,'old_stop':p['stop'],'new_stop':p['stop'],'detail':'stop_and_target_same_5m_bar; conservative stop-first'})
+        return close_position(key,state,s,p['stop'],t,'AMBIGUOUS_STOP_FIRST')
+    if stop_hit:return close_position(key,state,s,p['stop'],t,'STOP' if p.get('protected_stage',0)==0 else 'PROTECTED_STOP')
+    if tp_hit:return close_position(key,state,s,p['target'],t,'TAKE_PROFIT')
+
+    # MFE arms protection; candle close/structure determines how aggressively it is locked.
+    mfe=p['mfe_r'];close_r=(cl-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-cl)/p['stop_distance']
+    if mfe>=TRAIL_TRIGGER_R and close_r>=1.0:
+        lock=max(LOCK_PROFIT_R,close_r-TRAIL_GAP_R)
+        ns=p['entry_price']+lock*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-lock*p['stop_distance']
+        move_stop(key,p,t,ns,'TRAIL_UPDATED',close_r);p['protected_stage']=3
+    elif mfe>=LOCK_TRIGGER_R and close_r>=.65 and p.get('protected_stage',0)<2:
+        ns=p['entry_price']+LOCK_PROFIT_R*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-LOCK_PROFIT_R*p['stop_distance']
+        move_stop(key,p,t,ns,'MFE_LOCK_ARMED',close_r);p['protected_stage']=2
+    elif mfe>=BE_TRIGGER_R and close_r>=.35 and p.get('protected_stage',0)<1:
+        # Cost-aware BE: lock enough gross R to approximately cover expected round-trip cost.
+        cushion=min(.30,max(.08,float(p.get('estimated_cost_R') or .10)+.03))
+        ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
+        move_stop(key,p,t,ns,'BE_ARMED',close_r);p['protected_stage']=1
+
+    # Strategy invalidation on confirmed close, not on a wick.
+    if key=='BREAKOUT' and p['bars_held']>=2:
+        fail=(p['side']=='LONG' and close_r<-.35) or (p['side']=='SHORT' and close_r<-.35)
+        if fail:return close_position(key,state,s,cl,t,'FAILED_BREAKOUT')
+    if t-pd.Timestamp(p['entry_time'])>=pd.Timedelta(hours=STRATEGIES[key]['max_hours']):
+        return close_position(key,state,s,cl,t,'TIME_EXIT')
 
 def stats(state):
     t=state['total_trades']; w=state['winning_trades']; pf=state['gross_profit']/state['gross_loss'] if state['gross_loss'] else (999 if state['gross_profit'] else 0)
-    return {'balance':state['balance'],'peak_balance':state.get('peak_balance',state['balance']),'return_pct':(state['balance']/START_BALANCE-1)*100,'net_pnl':state['balance']-START_BALANCE,'net_r':(state['balance']-START_BALANCE)/(START_BALANCE*RISK_PER_TRADE) if RISK_PER_TRADE else 0,'trades':t,'wins':w,'losses':state.get('losing_trades',0),'winrate':100*w/t if t else 0,'pf':pf,'max_dd':100*state['max_drawdown'],'open_risk_pct':100*open_risk(state)}
+    return {'balance':state['balance'],'peak_balance':state.get('peak_balance',state['balance']),'return_pct':(state['balance']/START_BALANCE-1)*100,'net_pnl':state['balance']-START_BALANCE,'net_r':sum(float(x.get('net_R') or 0) for x in _read_csv_records(TRADES_FILE,100000)),'trades':t,'wins':w,'losses':state.get('losing_trades',0),'winrate':100*w/t if t else 0,'pf':pf,'max_dd':100*state['max_drawdown'],'open_risk_pct':100*open_risk(state)}
 
 
 def _read_csv_records(path,n=50):
@@ -391,9 +528,7 @@ DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="v
 <div class="card section"><h2>Open trades</h2>{% if openpos %}<div class="tablewrap"><table><tr><th>Strategy</th><th>Side</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Current R</th><th>MFE</th><th>MAE</th><th>Risk €</th></tr>{% for p in openpos %}<tr><td class="strategy">{{p.strategy}}</td><td>{{p.side}}</td><td>${{'{:,.0f}'.format(p.entry_price)}}</td><td>${{'{:,.0f}'.format(p.current_price)}}</td><td>${{'{:,.0f}'.format(p.stop)}}</td><td>${{'{:,.0f}'.format(p.target)}}</td><td class="{{'pos' if p.current_r>=0 else 'neg'}}">{{'%+.2f'|format(p.current_r)}}R</td><td class="pos">{{'%.2f'|format(p.mfe_r)}}R</td><td class="neg">{{'%.2f'|format(p.mae_r)}}R</td><td>€{{'%.2f'|format(p.risk_eur)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Geen open trades — V1 wacht op een geldige setup.</div>{% endif %}</div>
 <div class="two section"><div class="card"><h2>Recente decisions / signals</h2>{% if decisions %}<div class="tablewrap"><table><tr><th>Tijd</th><th>Strategy</th><th>Side</th><th>Decision</th><th>Setup</th><th>Regime</th><th>ADX</th></tr>{% for d in decisions %}<tr><td>{{d.time[11:16] if d.time else '—'}}</td><td class="strategy">{{d.strategy}}</td><td>{{d.side}}</td><td><span class="pill {{'pos' if d.decision=='OPEN' else 'amber' if d.decision=='SHADOW' else ''}}">{{d.decision}}</span></td><td>{{d.setup}}</td><td>{{d.regime}}</td><td>{{'%.1f'|format(d.adx_1h) if d.adx_1h is not none else '—'}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen signalen gelogd.</div>{% endif %}</div><div class="card"><h2>Performance per regime</h2>{% if regimes %}<div class="tablewrap"><table><tr><th>Regime</th><th>Trades</th><th>WR</th><th>Net R</th><th>P/L</th></tr>{% for x in regimes %}<tr><td class="strategy">{{x.regime}}</td><td>{{x.trades}}</td><td>{{'%.1f'|format(x.winrate)}}%</td><td class="{{'pos' if x.net_r>0 else 'neg' if x.net_r<0 else ''}}">{{'%+.2f'|format(x.net_r)}}</td><td class="{{'pos' if x.pnl>0 else 'neg' if x.pnl<0 else ''}}">€{{'%+.2f'|format(x.pnl)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Regime-statistieken verschijnen na de eerste gesloten trades.</div>{% endif %}</div></div>
 <div class="card section"><h2>Trade history</h2>{% if recent %}<div class="tablewrap"><table><tr><th>Exit</th><th>Strategy</th><th>Side</th><th>Setup</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross R</th><th>Costs R</th><th>Net R</th><th>MFE</th><th>MAE</th><th>Costs €</th><th>P/L</th><th>Balance</th></tr>{% for t in recent %}<tr><td>{{t.exit_time[5:16]|replace('T',' ')}}</td><td class="strategy">{{t.strategy}}</td><td>{{t.side}}</td><td>{{t.setup}}</td><td>${{'{:,.0f}'.format(t.entry)}}</td><td>${{'{:,.0f}'.format(t.exit)}}</td><td>{{t.reason}}</td><td>{{'%+.2f'|format(t.raw_R)}}R</td><td class="amber">-{{'%.2f'|format(t.costs_R)}}R</td><td class="{{'pos' if t.net_R>=0 else 'neg'}}">{{'%+.2f'|format(t.net_R)}}R</td><td class="pos">{{'%.2f'|format(t.MFE_R)}}R</td><td class="neg">{{'%.2f'|format(t.MAE_R)}}R</td><td>€{{'%.2f'|format(t.costs_eur)}}</td><td class="{{'pos' if t.pnl_eur>=0 else 'neg'}}">€{{'%+.2f'|format(t.pnl_eur)}}</td><td>€{{'%.2f'|format(t.balance)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen gesloten trades.</div>{% endif %}</div>
-<div class="card section"><h2>Data & exports</h2><div class="downloads"><a class="btn" href="/download/trades">↓ Trades CSV</a><a class="btn" href="/download/features">↓ Entry features CSV</a><a class="btn" href="/download/decisions">↓ Decisions CSV</a><a class="btn" href="/api/status">API status</a></div></div></div></body></html>'''
-repair_decisions_file()
-
+<div class="card section"><h2>Data & exports</h2><div class="downloads"><a class="btn" href="/download/trades">↓ Trades CSV</a><a class="btn" href="/download/features">↓ Entry features CSV</a><a class="btn" href="/download/decisions">↓ Decisions CSV</a><a class="btn" href="/download/events">↓ Management events</a><a class="btn" href="/download/shadow">↓ Shadow outcomes</a><a class="btn" href="/api/status">API status</a></div></div></div></body></html>'''
 app=Flask(__name__)
 def recent(n=30):
     rows=_read_csv_records(TRADES_FILE,n)
@@ -412,51 +547,66 @@ def dashboard():
     return render_template_string(DASH,s=stats(st),r=r,strat=strategy_dashboard(st),openpos=open_positions_dashboard(st,price),decisions=_read_csv_records(DECISIONS_FILE,36),regimes=regime_performance(),recent=recent(),maxrisk=MAX_TOTAL_RISK*100)
 @app.get('/api/status')
 def status():
-    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.4','stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
+    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.6-PRO','stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
 def dl(path,name):
     if not os.path.exists(path):return {'error':'Nog geen bestand.'},404
     return send_file(path,mimetype='text/csv',as_attachment=True,download_name=name)
 @app.get('/download/trades')
-def d1():return dl(TRADES_FILE,'btc_v1_trades.csv')
+def d1():return dl(TRADES_FILE,'btc_v16_trades.csv')
 @app.get('/download/features')
-def d2():return dl(FEATURES_FILE,'btc_v1_entry_features.csv')
+def d2():return dl(FEATURES_FILE,'btc_v16_entries.csv')
 @app.get('/download/decisions')
-def d3():return dl(DECISIONS_FILE,'btc_v1_decisions.csv')
+def d3():return dl(DECISIONS_FILE,'btc_v16_decisions.csv')
+@app.get('/download/events')
+def d4():return dl(EVENTS_FILE,'btc_v16_management_events.csv')
+@app.get('/download/shadow')
+def d5():return dl(SHADOW_FILE,'btc_v16_shadow_outcomes.csv')
 @app.get('/health')
-def health():return {'status':'ok','version':'BTC-V1.4'},200
+def health():return {'status':'ok','version':'BTC-V1.6-PRO'},200
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),threaded=True,use_reloader=False)
 
 def main():
-    threading.Thread(target=run_dashboard,daemon=True).start(); print('BTC V1 — PAPER ONLY',flush=True)
-    state=load_state(); candles=update_candles(load_candles())
+    threading.Thread(target=run_dashboard,daemon=True).start();print('BTC V1.6 PRO — PAPER ONLY',flush=True)
+    state=load_state();candles=update_candles(load_candles())
     while True:
         try:
-            candles=update_candles(candles); newest=candles.timestamp.iloc[-1]; prev=state.get('last_processed_5m')
+            candles=update_candles(candles);newest=candles.timestamp.iloc[-1];prev=state.get('last_processed_5m')
             if prev is None or newest>pd.Timestamp(prev):
                 new_rows=candles if prev is None else candles[candles.timestamp>pd.Timestamp(prev)]
                 for _,bar in new_rows.iterrows():
+                    update_shadows(state,bar)
                     for key in STRATEGIES:check_position(key,state,state['strategies'][key],bar)
                     state['last_processed_5m']=bar.timestamp.isoformat()
-                snap=regime_snapshot(candles)
+                snap=regime_snapshot(candles);refresh_risk_day(state)
                 for key,cfg in STRATEGIES.items():
-                    s=state['strategies'][key];s['scans']+=1;sig=signal_for(key,candles,snap)
-                    if sig:
-                        if sig.get('signal'):
-                            s['last_signal']=f"{sig['signal']} · {sig['reason']}";s['last_signal_time']=sig['time'].isoformat()
-                            decision='SHADOW' if not cfg['enabled'] else 'ALLOW' if sig.get('allowed') else 'BLOCK_REGIME'
-                            if cfg['enabled'] and not sig.get('allowed'): s['blocked']+=1
-                            if cfg['enabled'] and sig.get('allowed') and s.get('position') is None and not is_cooldown(s):
-                                if can_open(state):open_position(key,state,s,sig);decision='OPEN'
-                                else:s['blocked']+=1;decision='BLOCK_RISK_CAP'
-                            elif cfg['enabled'] and sig.get('allowed') and s.get('position') is not None:
-                                decision='BLOCK_ALREADY_OPEN'; s['blocked']+=1
-                            elif cfg['enabled'] and sig.get('allowed') and is_cooldown(s):
-                                decision='BLOCK_COOLDOWN'; s['blocked']+=1
-                            append_decision({**sig['features'],'decision':decision,'router_reason':sig.get('router_reason'),'open_risk_pct':100*open_risk(state)})
+                    st=state['strategies'][key];st['scans']+=1;sig=signal_for(key,candles,snap)
+                    if not sig:continue
+                    if not sig.get('signal'):
+                        append_decision({**sig['features'],'decision':'NO_SETUP','router_reason':'NO_CANDIDATE',
+                                         'router_allowed':False,'open_risk_pct':100*open_risk(state)})
+                        continue
+                    st['last_signal']=f"{sig['signal']} · {sig['reason']}";st['last_signal_time']=sig['time'].isoformat()
+                    decision=None
+                    if not cfg['enabled']:
+                        decision='SHADOW_STRATEGY'
+                    elif not sig.get('allowed'):
+                        decision='BLOCK_'+str(sig.get('router_reason'))
+                    elif st.get('position') is not None:
+                        decision='BLOCK_ALREADY_OPEN'
+                    elif is_cooldown(st):
+                        decision='BLOCK_STRATEGY_COOLDOWN'
+                    else:
+                        risk_ok,risk_reason=risk_permission(state)
+                        if not risk_ok:decision='BLOCK_'+risk_reason
                         else:
-                            # Diagnostic heartbeat: every confirmed 5m scan now records why each engine did not fire.
-                            append_decision({**sig['features'],'decision':'NO_SETUP','router_reason':'NOT_EVALUATED_NO_SIGNAL','open_risk_pct':100*open_risk(state)})
-                save_state(state);print(f"[STATUS] BTC={candles.close.iloc[-1]:,.0f} regime={snap.get('regime')} balance=€{state['balance']:.2f} trades={state['total_trades']}",flush=True)
+                            open_position(key,state,st,sig);decision='OPEN'
+                    if decision!='OPEN':
+                        st['blocked']+=1
+                        start_shadow(state,sig,decision)
+                    append_decision({**sig['features'],'decision':decision,'router_reason':sig.get('router_reason'),
+                                     'router_allowed':sig.get('allowed'),'open_risk_pct':100*open_risk(state)})
+                save_state(state)
+                print(f"[STATUS] BTC={candles.close.iloc[-1]:,.0f} state={snap.get('market_state')} dir={snap.get('direction')} balance=€{state['balance']:.2f} trades={state['total_trades']}",flush=True)
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:save_state(state);break
         except Exception as e:print('[ERROR]',repr(e),flush=True);save_state(state);time.sleep(60)
