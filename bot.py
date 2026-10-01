@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-# BTC V1.6 PRO — professional measurement baseline
+# BTC V1.6.1 PRO — professional measurement baseline
 INST_ID = os.getenv('INST_ID', 'BTC-USDT')
 START_BALANCE = float(os.getenv('START_BALANCE', '500'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
@@ -13,7 +13,8 @@ TAKER_FEE = float(os.getenv('TAKER_FEE', '0.00035'))
 SLIPPAGE_BPS = float(os.getenv('SLIPPAGE_BPS', '1.0'))
 POLL_SECONDS = int(os.getenv('POLL_SECONDS', '20'))
 BOOTSTRAP_DAYS = int(os.getenv('BOOTSTRAP_DAYS', '90'))
-MAX_TOTAL_RISK = float(os.getenv('MAX_TOTAL_RISK', '0.01'))
+MAX_TOTAL_RISK = float(os.getenv('MAX_TOTAL_RISK', '0.02'))
+MAX_OPEN_POSITIONS = int(os.getenv('MAX_OPEN_POSITIONS', '2'))
 COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_HOURS = 8
 MIN_SCORE = float(os.getenv('MIN_SCORE','65'))
@@ -354,7 +355,14 @@ def is_cooldown(s,now=None):
     if now>=until:s['cooldown_until']=None;return False
     return True
 
-def open_risk(state): return sum(RISK_PER_TRADE for x in state['strategies'].values() if x.get('position'))
+def open_risk(state):
+    # Use the actual risk stored on each live position. This matters when
+    # drawdown mode reduces a new trade from 1.0% to 0.5%.
+    return sum(float(x['position'].get('risk_pct', RISK_PER_TRADE))
+               for x in state['strategies'].values() if x.get('position'))
+
+def open_position_count(state):
+    return sum(1 for x in state['strategies'].values() if x.get('position'))
 
 def refresh_risk_day(state,now=None):
     now=now or utc_now(); day=now.date().isoformat()
@@ -364,7 +372,9 @@ def refresh_risk_day(state,now=None):
 def risk_permission(state):
     refresh_risk_day(state)
     if RISK_PER_TRADE>0.0100001:return False,'RISK_PER_TRADE_GT_1PCT'
-    if open_risk(state)+RISK_PER_TRADE>MAX_TOTAL_RISK+1e-12:return False,'TOTAL_EXPOSURE_CAP'
+    if open_position_count(state)>=MAX_OPEN_POSITIONS:return False,'MAX_OPEN_POSITIONS'
+    next_risk=effective_risk_pct(state)
+    if open_risk(state)+next_risk>MAX_TOTAL_RISK+1e-12:return False,'TOTAL_EXPOSURE_CAP'
     day_start=max(float(state.get('day_start_balance') or state['balance']),1e-9)
     if state['balance']/day_start-1<=-DAILY_LOSS_LIMIT:return False,'DAILY_LOSS_LIMIT'
     dd=state['balance']/max(state.get('peak_balance',state['balance']),1e-9)-1
@@ -566,7 +576,7 @@ def health():return {'status':'ok','version':'BTC-V1.6-PRO'},200
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),threaded=True,use_reloader=False)
 
 def main():
-    threading.Thread(target=run_dashboard,daemon=True).start();print('BTC V1.6 PRO — PAPER ONLY',flush=True)
+    threading.Thread(target=run_dashboard,daemon=True).start();print('BTC V1.6.1 PRO — PAPER ONLY',flush=True)
     state=load_state();candles=update_candles(load_candles())
     while True:
         try:
