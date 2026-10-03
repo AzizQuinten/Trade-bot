@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-# BTC V1.7.2 RESEARCH — independent paper account per strategy
+# BTC V1.7.3 RESEARCH — independent paper account per strategy
 INST_ID = os.getenv('INST_ID', 'BTC-USDT')
 START_BALANCE = float(os.getenv('START_BALANCE', '500'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
@@ -34,6 +34,7 @@ PROFIT_ZONE_R = float(os.getenv('PROFIT_ZONE_R','0.55'))
 DYNAMIC_PROTECT_R = float(os.getenv('DYNAMIC_PROTECT_R','0.75'))
 DETERIORATION_GIVEBACK_R = float(os.getenv('DETERIORATION_GIVEBACK_R','0.45'))
 DETERIORATION_CLOSE_R = float(os.getenv('DETERIORATION_CLOSE_R','0.35'))
+CONFIRMED_PROFIT_CLOSE_R = float(os.getenv('CONFIRMED_PROFIT_CLOSE_R','0.65'))
 OKX_URL = os.getenv('OKX_PUBLIC_BASE', 'https://www.okx.com')
 HISTORY_ENDPOINT = '/api/v5/market/history-candles'
 LIVE_ENDPOINT = '/api/v5/market/candles'
@@ -41,11 +42,11 @@ DATA_DIR = os.getenv('DATA_DIR', '/data')
 try: os.makedirs(DATA_DIR, exist_ok=True)
 except PermissionError:
     DATA_DIR = './data'; os.makedirs(DATA_DIR, exist_ok=True)
-STATE_FILE = os.path.join(DATA_DIR, 'btc_v172_state.json')
-TRADES_FILE = os.path.join(DATA_DIR, 'btc_v172_trades.csv')
-FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v172_entries.csv')
-DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v172_decisions.csv')
-CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v172_candles_5m.csv')
+STATE_FILE = os.path.join(DATA_DIR, 'btc_v173_state.json')
+TRADES_FILE = os.path.join(DATA_DIR, 'btc_v173_trades.csv')
+FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v173_entries.csv')
+DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v173_decisions.csv')
+CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v173_candles_5m.csv')
 
 STRATEGIES = {
  'SMC_SWEEP': {'label':'Liquidity Sweep / Reversal','rr':2.5,'stop_atr':1.35,'max_hours':6,'enabled':True},
@@ -57,7 +58,7 @@ STRATEGIES = {
 }
 
 
-session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.7.2-RESEARCH'})
+session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.7.3-RESEARCH'})
 state_lock=threading.RLock()
 def utc_now(): return datetime.now(timezone.utc)
 def finite(x):
@@ -67,7 +68,7 @@ def finite(x):
 def strategy_default():
     return {'position':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'risk_day':None,'day_start_balance':START_BALANCE,'loss_streak':0,'cooldown_until':None,'scans':0,'signals':0,'blocked':0,'last_signal':'—','last_signal_time':None}
 def default_state():
-    return {'version':'BTC-V1.7.2-RESEARCH','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
+    return {'version':'BTC-V1.7.3-RESEARCH','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
 def normalize_state(s):
     base=default_state()
     for k,v in base.items(): s.setdefault(k,v)
@@ -184,15 +185,36 @@ def regime_snapshot(c):
         return {'regime':'WARMUP','direction':'NEUTRAL','strength':'WEAK','volatility':'UNKNOWN','market_state':'WARMUP'}
 
 def router(key,side,snap):
+    """V1.7.3 strategy mandate router.
+    Live research trades only execute inside the strategy's pre-declared market mandate.
+    Rejected candidates are still shadow-tracked, so the filter remains testable.
+    """
     state=snap.get('market_state'); direction=snap.get('direction'); strength=snap.get('strength')
     if state=='WARMUP': return False,'REGIME_WARMUP'
-    if key in {'BREAKOUT','MOMENTUM'} and state in {'RANGE_CHOP','CONTRACTION'}: return False,'WRONG_REGIME_TREND_ENGINE'
-    if key in {'EMA_SCALP','TREND_PULLBACK'} and state=='RANGE_CHOP': return False,'WRONG_REGIME_CONTINUATION'
-    if key=='SMC_SWEEP' and state=='EXPANSION' and strength=='STRONG': return False,'NO_FADE_STRONG_EXPANSION'
-    if key=='MEAN_REVERSION':
-        if state!='RANGE_CHOP': return False,'MEAN_REVERSION_RANGE_ONLY'
-    if direction=='BULL' and side=='SHORT' and strength=='STRONG': return False,'HOSTILE_HTF_DIRECTION'
-    if direction=='BEAR' and side=='LONG' and strength=='STRONG': return False,'HOSTILE_HTF_DIRECTION'
+
+    # Trend engines require an environment capable of directional follow-through.
+    if key in {'BREAKOUT','MOMENTUM'} and state not in {'TREND','EXPANSION'}:
+        return False,'OUTSIDE_TREND_EXPANSION_MANDATE'
+    if key=='EMA_SCALP' and state not in {'TREND','TRANSITION','EXPANSION'}:
+        return False,'OUTSIDE_CONTINUATION_MANDATE'
+    if key=='TREND_PULLBACK' and state not in {'TREND','TRANSITION','EXPANSION'}:
+        return False,'OUTSIDE_HTF_TREND_MANDATE'
+
+    # Reversal engines are deliberately separated from trend engines.
+    if key=='SMC_SWEEP' and state not in {'RANGE_CHOP','CONTRACTION','TRANSITION'}:
+        return False,'OUTSIDE_SWEEP_REVERSAL_MANDATE'
+    if key=='MEAN_REVERSION' and state!='RANGE_CHOP':
+        return False,'MEAN_REVERSION_RANGE_ONLY'
+
+    # Directional continuation systems do not take explicit HTF countertrend bets.
+    if key in {'EMA_SCALP','MOMENTUM','BREAKOUT','TREND_PULLBACK'}:
+        if direction=='BULL' and side=='SHORT': return False,'COUNTERTREND_CONTINUATION'
+        if direction=='BEAR' and side=='LONG': return False,'COUNTERTREND_CONTINUATION'
+
+    # Reversal engines may oppose HTF direction, except against a strong directional tape.
+    if key in {'SMC_SWEEP','MEAN_REVERSION'}:
+        if direction=='BULL' and side=='SHORT' and strength=='STRONG': return False,'HOSTILE_STRONG_HTF'
+        if direction=='BEAR' and side=='LONG' and strength=='STRONG': return False,'HOSTILE_STRONG_HTF'
     return True,'CONTEXT_OK'
 
 def base_features(key,side,setup,d5,d15,d1,d4,snap):
@@ -244,11 +266,15 @@ def detect_ema(d5,d15,d1,d4,snap):
     return None,'WAIT_EMA_RETEST',None,0
 
 def detect_momentum(d5,d15,d1,d4,snap):
-    c,p=d5.iloc[-1],d5.iloc[-2]; recent=d5.iloc[-7:-1]
-    up=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi>=54)).any())
-    dn=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi<=46)).any())
-    if up and c.close>c.ema9 and c.close>p.close and c.rsi>=51:return 'LONG','IMPULSE_CONTINUATION',float(c.atr*1.40),21
-    if dn and c.close<c.ema9 and c.close<p.close and c.rsi<=49:return 'SHORT','IMPULSE_CONTINUATION',float(c.atr*1.40),21
+    c,p=d5.iloc[-1],d5.iloc[-2]; recent=d5.iloc[-5:-1]
+    prior_up=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi>=54)).any())
+    prior_dn=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi<=46)).any())
+    # Current bar must confirm continuation; a stale impulse alone can no longer trigger.
+    cur_quality=finite(c.body_atr) and finite(c.volume_ratio) and c.body_atr>=.25 and c.volume_ratio>=.80
+    if prior_up and cur_quality and c.close>c.open and c.close>c.ema9 and c.close>p.close and c.rsi>=52:
+        return 'LONG','MOMENTUM_CONFIRMED_CONTINUATION',float(c.atr*1.40),23
+    if prior_dn and cur_quality and c.close<c.open and c.close<c.ema9 and c.close<p.close and c.rsi<=48:
+        return 'SHORT','MOMENTUM_CONFIRMED_CONTINUATION',float(c.atr*1.40),23
     return None,'WAIT_MOMENTUM',None,0
 
 def detect_breakout(d5,d15,d1,d4,snap):
@@ -260,11 +286,16 @@ def detect_breakout(d5,d15,d1,d4,snap):
     return None,'WAIT_BREAKOUT_RETEST',None,0
 
 def detect_trend_pullback(d5,d15,d1,d4,snap):
-    c,p=d15.iloc[-1],d15.iloc[-2]; h=d1.iloc[-1]
-    bull=h.ema20>h.ema50 and h.ema20_slope3>0 and h.adx>=18
-    bear=h.ema20<h.ema50 and h.ema20_slope3<0 and h.adx>=18
-    if bull and p.low<=p.ema20*1.003 and c.close>c.ema20 and c.close>p.close:return 'LONG','HTF_PULLBACK_RESUME',float(c.atr*1.65),23
-    if bear and p.high>=p.ema20*.997 and c.close<c.ema20 and c.close<p.close:return 'SHORT','HTF_PULLBACK_RESUME',float(c.atr*1.65),23
+    c=d15.iloc[-1]; h=d1.iloc[-1]; recent=d15.iloc[-4:-1]
+    bull=bool(h.ema20>h.ema50 and h.ema20_slope3>0)
+    bear=bool(h.ema20<h.ema50 and h.ema20_slope3<0)
+    # A pullback may occur over several 15m candles; require current candle to resume.
+    bull_touch=bool((recent.low<=recent.ema20*1.003).any())
+    bear_touch=bool((recent.high>=recent.ema20*.997).any())
+    bull_resume=bool(c.close>c.open and c.close>c.ema20 and c.close>c.ema9 and c.rsi>=50)
+    bear_resume=bool(c.close<c.open and c.close<c.ema20 and c.close<c.ema9 and c.rsi<=50)
+    if bull and bull_touch and bull_resume:return 'LONG','HTF_PULLBACK_RESUME',float(c.atr*1.65),24
+    if bear and bear_touch and bear_resume:return 'SHORT','HTF_PULLBACK_RESUME',float(c.atr*1.65),24
     return None,'WAIT_HTF_PULLBACK',None,0
 
 def detect_mean_reversion(d5,d15,d1,d4,snap):
@@ -288,8 +319,8 @@ EVENT_COLUMNS=['schema_version','candidate_id','time','strategy','event','price'
 SHADOW_COLUMNS=['schema_version','candidate_id','strategy','side','setup','decision','block_reason','entry_time','finish_time','entry',
  'stop','target','MFE_R','MAE_R','first_touch','bars','regime','score_total']
 
-EVENTS_FILE=os.path.join(DATA_DIR,'btc_v172_management_events.csv')
-SHADOW_FILE=os.path.join(DATA_DIR,'btc_v172_shadow_outcomes.csv')
+EVENTS_FILE=os.path.join(DATA_DIR,'btc_v173_management_events.csv')
+SHADOW_FILE=os.path.join(DATA_DIR,'btc_v173_shadow_outcomes.csv')
 
 def append_fixed(path,row,columns):
     clean={k:row.get(k) for k in columns}
@@ -309,7 +340,7 @@ def signal_for(key,c,snap):
     d5,d15,d1,d4=frames(c)
     if min(len(d15),len(d1),len(d4))<200:return None
     side,setup,dist,trigger=DETECTORS[key](d5,d15,d1,d4,snap)
-    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='3.1'
+    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='4.0'
     if not side:return {'signal':None,'time':d5.index[-1],'reason':setup,'features':feat}
     c5=d5.iloc[-1]
     # V1.7.2 diagnostics: measure hypotheses without using them as hard research filters.
@@ -341,8 +372,10 @@ def signal_for(key,c,snap):
     score_pass=bool(scores['score_total']>=MIN_SCORE)
     feat['run_mode']=RUN_MODE; feat['context_fit']=context_fit; feat['context_reason']=context_reason; feat['score_pass']=score_pass
     if RESEARCH_MODE:
-        allowed = snap.get('market_state') != 'WARMUP'
-        why = 'RESEARCH_EXECUTE' if allowed else 'REGIME_WARMUP'
+        # V1.7.3: do not burn the live research account on candidates outside the strategy mandate.
+        # They remain observable through the shadow engine. Score stays advisory until validated OOS.
+        allowed=context_fit
+        why='RESEARCH_CONTEXT_OK' if context_fit else context_reason
     else:
         allowed=context_fit and score_pass
         why=context_reason if not context_fit else ('SCORE_BELOW_BASELINE' if not score_pass else 'CONTEXT_OK')
@@ -375,7 +408,7 @@ def update_shadows(state,bar):
         elif tp_hit:x['first_touch']='TARGET'
         if x['first_touch']!='NONE' or x['bars']>=96:
             if x['first_touch']=='NONE':x['first_touch']='TIME'
-            append_fixed(SHADOW_FILE,{**x,'schema_version':'3.1','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
+            append_fixed(SHADOW_FILE,{**x,'schema_version':'4.0','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
     for cid in done:state['shadow_candidates'].pop(cid,None)
 
 def is_cooldown(s,now=None):
@@ -417,6 +450,20 @@ def effective_risk_pct(account):
     dd=account['balance']/max(account.get('peak_balance',account['balance']),1e-9)-1
     return min(RISK_PER_TRADE,0.005 if dd<=-DRAWDOWN_SOFT else RISK_PER_TRADE)
 
+def validate_order_candidate(key,sig):
+    """Fail closed on malformed sizing/geometry instead of silently opening a corrupt paper trade."""
+    try:
+        entry=float(sig['entry']); dist=float(sig['stop_distance']); side=sig['signal']
+        if side not in {'LONG','SHORT'}: return False,'INVALID_SIDE'
+        if not finite(entry) or not finite(dist) or entry<=0 or dist<=0:return False,'INVALID_ENTRY_OR_STOP_DISTANCE'
+        if dist/entry<=0 or dist/entry>=0.10:return False,'IMPLAUSIBLE_STOP_DISTANCE'
+        est=float(sig.get('estimated_cost_R') or 0)
+        if not finite(est) or est<0 or est>MAX_COST_R+1e-9:return False,'COST_MODEL_BREACH'
+        if key not in STRATEGIES:return False,'UNKNOWN_STRATEGY'
+        return True,'ORDER_SANITY_OK'
+    except Exception:
+        return False,'ORDER_SANITY_EXCEPTION'
+
 def open_position(key,state,s,sig):
     entry,dist,side=sig['entry'],sig['stop_distance'],sig['signal'];cfg=STRATEGIES[key]
     stop=entry-dist if side=='LONG' else entry+dist;target=entry+cfg['rr']*dist if side=='LONG' else entry-cfg['rr']*dist
@@ -424,11 +471,11 @@ def open_position(key,state,s,sig):
     p={'candidate_id':sig['candidate_id'],'side':side,'entry_time':sig['time'].isoformat(),'entry_price':entry,
        'initial_stop':stop,'stop':stop,'target':target,'stop_distance':dist,'risk_eur':risk_eur,'risk_pct':risk_pct,
        'qty':qty,'notional':notional,'setup':sig['reason'],'regime':sig.get('regime'),'mfe_r':0.0,'mae_r':0.0,
-       'protected_stage':0,'exit_state':'UNPROTECTED','profit_zone_seen':False,'score_total':sig.get('score'),'estimated_cost_R':sig.get('estimated_cost_R'),'bars_held':0}
+       'protected_stage':0,'exit_state':'UNPROTECTED','profit_zone_seen':False,'milestones_seen':[],'score_total':sig.get('score'),'estimated_cost_R':sig.get('estimated_cost_R'),'bars_held':0}
     s['position']=p;s['signals']+=1;s['last_signal']=f"{side} · {sig['reason']}";s['last_signal_time']=sig['time'].isoformat()
     append_entry({**sig['features'],'entry':entry,'initial_stop':stop,'initial_target':target,'stop_distance':dist,
                   'stop_pct':dist/entry,'risk_eur':risk_eur,'qty':qty,'notional':notional})
-    log_event({'schema_version':'3.1','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
+    log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
                'price':entry,'r_value':0,'old_stop':stop,'new_stop':stop,'detail':f"risk_pct={risk_pct:.4f}"})
     print(f'[ENTRY][{key}] {side} {entry:.2f} stop={stop:.2f} tp={target:.2f} score={sig.get("score"):.0f}',flush=True)
 
@@ -443,12 +490,12 @@ def close_position(key,state,s,exit_price,exit_time,reason):
         state['losing_trades']+=1;state['gross_loss']+=abs(pnl);s['loss_streak']+=1
         if (not RESEARCH_MODE) and s['loss_streak']>=COOLDOWN_AFTER_LOSSES:s['cooldown_until']=(exit_time+timedelta(hours=COOLDOWN_HOURS)).isoformat()
     giveback=max(0,float(p.get('mfe_r',0))-raw_r)
-    append_fixed(TRADES_FILE,{'schema_version':'3.1','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
+    append_fixed(TRADES_FILE,{'schema_version':'4.0','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
       'exit_time':exit_time.isoformat(),'side':p['side'],'setup':p['setup'],'regime':p.get('regime'),'score_total':p.get('score_total'),
       'entry':p['entry_price'],'exit':exit_price,'initial_stop':p['initial_stop'],'final_stop':p['stop'],'target':p['target'],
       'raw_R':raw_r,'net_R':net_r,'reason':reason,'gross_pnl_eur':gross,'fees_eur':fee,'slippage_eur':slip,'pnl_eur':pnl,
       'balance':s['balance'],'MFE_R':p['mfe_r'],'MAE_R':p['mae_r'],'giveback_R':giveback,'bars_held':p.get('bars_held',0)},TRADE_COLUMNS)
-    log_event({'schema_version':'3.1','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
+    log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
                'price':exit_price,'r_value':raw_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':reason})
     s['position']=None;print(f'[EXIT][{key}] {reason} rawR={raw_r:.2f} netR={net_r:.2f}',flush=True)
 
@@ -458,7 +505,7 @@ def move_stop(key,p,t,new_stop,event,r_value):
     else:new_stop=min(old,new_stop)
     if abs(new_stop-old)>1e-9:
         p['stop']=new_stop
-        log_event({'schema_version':'3.1','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
+        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
                    'price':None,'r_value':r_value,'old_stop':old,'new_stop':new_stop,'detail':''})
 
 def check_position(key,state,s,candle):
@@ -468,9 +515,17 @@ def check_position(key,state,s,candle):
     fav=(h-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-l)/p['stop_distance']
     adv=(l-p['entry_price'])/p['stop_distance'] if p['side']=='LONG' else (p['entry_price']-h)/p['stop_distance']
     p['mfe_r']=max(p.get('mfe_r',0),fav);p['mae_r']=min(p.get('mae_r',0),adv)
+    seen=set(p.get('milestones_seen') or [])
+    for level in (0.25,0.50,0.75,1.00,1.25,1.50,2.00,2.50,3.00):
+        tag=f'{level:.2f}R'
+        if p['mfe_r']>=level and tag not in seen:
+            seen.add(tag)
+            log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,
+                       'event':'MFE_MILESTONE','price':cl,'r_value':level,'old_stop':p['stop'],'new_stop':p['stop'],'detail':tag})
+    p['milestones_seen']=sorted(seen)
     stop_hit=l<=p['stop'] if p['side']=='LONG' else h>=p['stop'];tp_hit=h>=p['target'] if p['side']=='LONG' else l<=p['target']
     if stop_hit and tp_hit:
-        log_event({'schema_version':'3.1','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
+        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
                    'price':cl,'r_value':None,'old_stop':p['stop'],'new_stop':p['stop'],'detail':'stop_and_target_same_5m_bar; conservative stop-first'})
         return close_position(key,state,s,p['stop'],t,'AMBIGUOUS_STOP_FIRST')
     if stop_hit:return close_position(key,state,s,p['stop'],t,'STOP' if p.get('protected_stage',0)==0 else 'PROTECTED_STOP')
@@ -481,7 +536,13 @@ def check_position(key,state,s,candle):
     prev_state=p.get('exit_state','UNPROTECTED')
     if mfe>=PROFIT_ZONE_R and not p.get('profit_zone_seen'):
         p['profit_zone_seen']=True;p['exit_state']='PROFIT_ZONE'
-        log_event({'schema_version':'3.1','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'PROFIT_ZONE_ENTERED','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'mfe={mfe:.2f}'})
+        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'PROFIT_ZONE_ENTERED','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'mfe={mfe:.2f}'})
+    # Confirmed-close protection: only a completed 5m close >= threshold can arm it.
+    # This avoids retroactive intrabar assumptions and targets the observed +R -> full-loss leakage.
+    if close_r>=CONFIRMED_PROFIT_CLOSE_R and p.get('protected_stage',0)<1:
+        cushion=min(.22,max(.05,float(p.get('estimated_cost_R') or .10)+.02))
+        ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
+        move_stop(key,p,t,ns,'CONFIRMED_PROFIT_PROTECT',close_r);p['protected_stage']=1;p['exit_state']='PROTECTED'
     # Deterioration = meaningful giveback after a useful excursion plus weak close. Protect modestly, never widen risk.
     giveback=max(0.0,mfe-close_r)
     deterioration=(mfe>=DYNAMIC_PROTECT_R and giveback>=DETERIORATION_GIVEBACK_R and close_r<=DETERIORATION_CLOSE_R)
@@ -502,7 +563,7 @@ def check_position(key,state,s,candle):
         ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
         move_stop(key,p,t,ns,'BE_ARMED',close_r);p['protected_stage']=1;p['exit_state']='PROTECTED'
     if p.get('exit_state')!=prev_state:
-        log_event({'schema_version':'3.1','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'EXIT_STATE_CHANGE','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'{prev_state}->{p.get("exit_state")};mfe={mfe:.2f};giveback={giveback:.2f}'})
+        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'EXIT_STATE_CHANGE','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'{prev_state}->{p.get("exit_state")};mfe={mfe:.2f};giveback={giveback:.2f}'})
 
     # Strategy invalidation on confirmed close, not on a wick.
     if key=='BREAKOUT' and p['bars_held']>=2:
@@ -576,7 +637,7 @@ def regime_performance():
             out.append({'regime':rg,'trades':len(d),'winrate':100*(pnl>0).mean(),'pnl':float(pnl.sum()),'net_r':float(nr.sum())})
         return sorted(out,key=lambda x:x['trades'],reverse=True)
     except Exception:return []
-DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>BTC V1 Control Center</title><style>
+DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>BTC V1.7.3 Quant Research</title><style>
 :root{--bg:#0b0e13;--card:#151922;--card2:#10141c;--line:#2a3140;--text:#f5f7fb;--muted:#8e98aa;--green:#55d68b;--red:#ff6b72;--amber:#f3c969}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:14px}.w{max-width:1250px;margin:auto}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:8px 2px 16px}.title{font-size:34px;font-weight:900}.sub,.muted{color:var(--muted)}.running{font-size:12px;padding:6px 9px;border-radius:999px;background:#153222;color:var(--green);font-weight:800}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:9px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px}.label{font-size:11px;color:var(--muted);text-transform:uppercase}.value{font-size:24px;font-weight:850;margin-top:4px}.mini{font-size:12px;margin-top:3px}.pos{color:var(--green)!important}.neg{color:var(--red)!important}.amber{color:var(--amber)!important}.section{margin-top:10px}.section h2{font-size:16px;margin:0 0 10px}.market{display:grid;grid-template-columns:1.4fr repeat(4,1fr);gap:9px}.tag{display:inline-block;padding:4px 7px;border-radius:999px;font-size:10px}.live{background:#153222;color:var(--green)}.shadow{background:#332d18;color:var(--amber)}.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}td,th{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:10px;text-transform:uppercase}.strategy{font-weight:750}.pill{padding:3px 6px;border-radius:6px;background:#242b39;font-size:10px}.two{display:grid;grid-template-columns:1.35fr 1fr;gap:10px}.empty{padding:18px;text-align:center;color:var(--muted);background:var(--card2);border-radius:10px}.downloads{display:flex;gap:8px;flex-wrap:wrap}.btn{color:var(--text);text-decoration:none;background:#242b39;border:1px solid #343d4f;border-radius:9px;padding:8px 10px;font-size:12px}.small{font-size:10px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(3,1fr)}.market{grid-template-columns:repeat(3,1fr)}.two{grid-template-columns:1fr}}@media(max-width:520px){body{padding:10px}.grid{grid-template-columns:repeat(2,1fr)}.market{grid-template-columns:repeat(2,1fr)}.market>div:first-child{grid-column:span 2}.card{padding:11px}.value{font-size:21px}}
 </style></head><body><div class="w"><div class="top"><div><div class="title">BTC V1</div><div class="sub">Control Center · independent strategy accounts · paper trading · refresh 20s</div></div><div class="running">● RUNNING</div></div>
@@ -611,26 +672,26 @@ def dashboard():
     return render_template_string(DASH,s=stats(st),r=r,strat=strategy_dashboard(st),openpos=open_positions_dashboard(st,price),decisions=_read_csv_records(DECISIONS_FILE,36),regimes=regime_performance(),recent=recent())
 @app.get('/api/status')
 def status():
-    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.7.2-RESEARCH','run_mode':RUN_MODE,'stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
+    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.7.3-RESEARCH','run_mode':RUN_MODE,'stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
 def dl(path,name):
     if not os.path.exists(path):return {'error':'Nog geen bestand.'},404
     return send_file(path,mimetype='text/csv',as_attachment=True,download_name=name)
 @app.get('/download/trades')
-def d1():return dl(TRADES_FILE,'btc_v172_trades.csv')
+def d1():return dl(TRADES_FILE,'btc_v173_trades.csv')
 @app.get('/download/features')
-def d2():return dl(FEATURES_FILE,'btc_v172_entries.csv')
+def d2():return dl(FEATURES_FILE,'btc_v173_entries.csv')
 @app.get('/download/decisions')
-def d3():return dl(DECISIONS_FILE,'btc_v172_decisions.csv')
+def d3():return dl(DECISIONS_FILE,'btc_v173_decisions.csv')
 @app.get('/download/events')
-def d4():return dl(EVENTS_FILE,'btc_v172_management_events.csv')
+def d4():return dl(EVENTS_FILE,'btc_v173_management_events.csv')
 @app.get('/download/shadow')
-def d5():return dl(SHADOW_FILE,'btc_v172_shadow_outcomes.csv')
+def d5():return dl(SHADOW_FILE,'btc_v173_shadow_outcomes.csv')
 @app.get('/health')
-def health():return {'status':'ok','version':'BTC-V1.7.2-RESEARCH','run_mode':RUN_MODE,'risk_per_trade':RISK_PER_TRADE},200
+def health():return {'status':'ok','version':'BTC-V1.7.3-RESEARCH','run_mode':RUN_MODE,'risk_per_trade':RISK_PER_TRADE},200
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),threaded=True,use_reloader=False)
 
 def main():
-    threading.Thread(target=run_dashboard,daemon=True).start();print(f'BTC V1.7.2 RESEARCH — PAPER ONLY — mode={RUN_MODE} — independent strategy accounts — risk/trade={RISK_PER_TRADE:.2%}',flush=True)
+    threading.Thread(target=run_dashboard,daemon=True).start();print(f'BTC V1.7.3 RESEARCH — PAPER ONLY — mode={RUN_MODE} — independent strategy accounts — risk/trade={RISK_PER_TRADE:.2%}',flush=True)
     state=load_state();candles=update_candles(load_candles())
     while True:
         try:
@@ -660,10 +721,14 @@ def main():
                     elif (not RESEARCH_MODE) and is_cooldown(st):
                         decision='BLOCK_STRATEGY_COOLDOWN'
                     else:
-                        risk_ok,risk_reason=risk_permission(st)
-                        if not risk_ok:decision='BLOCK_'+risk_reason
+                        order_ok,order_reason=validate_order_candidate(key,sig)
+                        if not order_ok:
+                            decision='BLOCK_'+order_reason
                         else:
-                            open_position(key,state,st,sig);decision='OPEN'
+                            risk_ok,risk_reason=risk_permission(st)
+                            if not risk_ok:decision='BLOCK_'+risk_reason
+                            else:
+                                open_position(key,state,st,sig);decision='OPEN'
                     if decision!='OPEN':
                         st['blocked']+=1
                         start_shadow(state,sig,decision)
