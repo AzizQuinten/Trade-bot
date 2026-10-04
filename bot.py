@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-# BTC V1.7.3 RESEARCH — independent paper account per strategy
+# BTC V1.7.4 RESEARCH — independent paper account per strategy
 INST_ID = os.getenv('INST_ID', 'BTC-USDT')
 START_BALANCE = float(os.getenv('START_BALANCE', '500'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
@@ -35,6 +35,10 @@ DYNAMIC_PROTECT_R = float(os.getenv('DYNAMIC_PROTECT_R','0.75'))
 DETERIORATION_GIVEBACK_R = float(os.getenv('DETERIORATION_GIVEBACK_R','0.45'))
 DETERIORATION_CLOSE_R = float(os.getenv('DETERIORATION_CLOSE_R','0.35'))
 CONFIRMED_PROFIT_CLOSE_R = float(os.getenv('CONFIRMED_PROFIT_CLOSE_R','0.65'))
+LIVE_MIN_QUALITY = float(os.getenv('LIVE_MIN_QUALITY','0.58'))
+SOFT_CONTEXT_MIN_QUALITY = float(os.getenv('SOFT_CONTEXT_MIN_QUALITY','0.72'))
+MAX_LIVE_COST_R = float(os.getenv('MAX_LIVE_COST_R','0.30'))
+
 OKX_URL = os.getenv('OKX_PUBLIC_BASE', 'https://www.okx.com')
 HISTORY_ENDPOINT = '/api/v5/market/history-candles'
 LIVE_ENDPOINT = '/api/v5/market/candles'
@@ -42,11 +46,11 @@ DATA_DIR = os.getenv('DATA_DIR', '/data')
 try: os.makedirs(DATA_DIR, exist_ok=True)
 except PermissionError:
     DATA_DIR = './data'; os.makedirs(DATA_DIR, exist_ok=True)
-STATE_FILE = os.path.join(DATA_DIR, 'btc_v173_state.json')
-TRADES_FILE = os.path.join(DATA_DIR, 'btc_v173_trades.csv')
-FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v173_entries.csv')
-DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v173_decisions.csv')
-CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v173_candles_5m.csv')
+STATE_FILE = os.path.join(DATA_DIR, 'btc_v174_state.json')
+TRADES_FILE = os.path.join(DATA_DIR, 'btc_v174_trades.csv')
+FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v174_entries.csv')
+DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v174_decisions.csv')
+CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v174_candles_5m.csv')
 
 STRATEGIES = {
  'SMC_SWEEP': {'label':'Liquidity Sweep / Reversal','rr':2.5,'stop_atr':1.35,'max_hours':6,'enabled':True},
@@ -58,7 +62,7 @@ STRATEGIES = {
 }
 
 
-session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.7.3-RESEARCH'})
+session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.7.4-RESEARCH'})
 state_lock=threading.RLock()
 def utc_now(): return datetime.now(timezone.utc)
 def finite(x):
@@ -68,7 +72,7 @@ def finite(x):
 def strategy_default():
     return {'position':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'risk_day':None,'day_start_balance':START_BALANCE,'loss_streak':0,'cooldown_until':None,'scans':0,'signals':0,'blocked':0,'last_signal':'—','last_signal_time':None}
 def default_state():
-    return {'version':'BTC-V1.7.3-RESEARCH','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
+    return {'version':'BTC-V1.7.4-RESEARCH','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
 def normalize_state(s):
     base=default_state()
     for k,v in base.items(): s.setdefault(k,v)
@@ -185,37 +189,33 @@ def regime_snapshot(c):
         return {'regime':'WARMUP','direction':'NEUTRAL','strength':'WEAK','volatility':'UNKNOWN','market_state':'WARMUP'}
 
 def router(key,side,snap):
-    """V1.7.3 strategy mandate router.
-    Live research trades only execute inside the strategy's pre-declared market mandate.
-    Rejected candidates are still shadow-tracked, so the filter remains testable.
+    """Context assessment, not a one-label veto.
+    Returns (allowed_context, reason). Hard invalid contexts are rejected; soft mismatches
+    may still execute only when detector quality is independently strong.
     """
     state=snap.get('market_state'); direction=snap.get('direction'); strength=snap.get('strength')
-    if state=='WARMUP': return False,'REGIME_WARMUP'
+    if state=='WARMUP': return False,'HARD_WARMUP'
 
-    # Trend engines require an environment capable of directional follow-through.
-    if key in {'BREAKOUT','MOMENTUM'} and state not in {'TREND','EXPANSION'}:
-        return False,'OUTSIDE_TREND_EXPANSION_MANDATE'
-    if key=='EMA_SCALP' and state not in {'TREND','TRANSITION','EXPANSION'}:
-        return False,'OUTSIDE_CONTINUATION_MANDATE'
-    if key=='TREND_PULLBACK' and state not in {'TREND','TRANSITION','EXPANSION'}:
-        return False,'OUTSIDE_HTF_TREND_MANDATE'
-
-    # Reversal engines are deliberately separated from trend engines.
-    if key=='SMC_SWEEP' and state not in {'RANGE_CHOP','CONTRACTION','TRANSITION'}:
-        return False,'OUTSIDE_SWEEP_REVERSAL_MANDATE'
+    # Mean reversion has a genuinely incompatible mandate outside ranges.
     if key=='MEAN_REVERSION' and state!='RANGE_CHOP':
-        return False,'MEAN_REVERSION_RANGE_ONLY'
+        return False,'HARD_MEAN_REVERSION_NOT_RANGE'
 
-    # Directional continuation systems do not take explicit HTF countertrend bets.
+    # Strong HTF opposition is a hard invalidation for continuation systems.
     if key in {'EMA_SCALP','MOMENTUM','BREAKOUT','TREND_PULLBACK'}:
-        if direction=='BULL' and side=='SHORT': return False,'COUNTERTREND_CONTINUATION'
-        if direction=='BEAR' and side=='LONG': return False,'COUNTERTREND_CONTINUATION'
+        if direction=='BULL' and side=='SHORT' and strength=='STRONG': return False,'HARD_STRONG_COUNTERTREND'
+        if direction=='BEAR' and side=='LONG' and strength=='STRONG': return False,'HARD_STRONG_COUNTERTREND'
 
-    # Reversal engines may oppose HTF direction, except against a strong directional tape.
-    if key in {'SMC_SWEEP','MEAN_REVERSION'}:
-        if direction=='BULL' and side=='SHORT' and strength=='STRONG': return False,'HOSTILE_STRONG_HTF'
-        if direction=='BEAR' and side=='LONG' and strength=='STRONG': return False,'HOSTILE_STRONG_HTF'
-    return True,'CONTEXT_OK'
+    # SMC fades are forbidden only against strong expansion.
+    if key=='SMC_SWEEP' and state=='EXPANSION' and strength=='STRONG':
+        return False,'HARD_NO_FADE_STRONG_EXPANSION'
+
+    preferred = (
+        (key in {'BREAKOUT','MOMENTUM'} and state in {'TREND','EXPANSION'}) or
+        (key in {'EMA_SCALP','TREND_PULLBACK'} and state in {'TREND','TRANSITION','EXPANSION'}) or
+        (key=='SMC_SWEEP' and state in {'RANGE_CHOP','CONTRACTION','TRANSITION'}) or
+        (key=='MEAN_REVERSION' and state=='RANGE_CHOP')
+    )
+    return True,'PREFERRED_CONTEXT' if preferred else 'SOFT_CONTEXT_MISMATCH'
 
 def base_features(key,side,setup,d5,d15,d1,d4,snap):
     c5,c15=d5.iloc[-1],d15.iloc[-1]
@@ -250,64 +250,97 @@ def score_setup(key,side,trigger,ctx,snap):
             'score_volume':float(volume),'score_structure':float(structure)}
 
 def detect_smc(d5,d15,d1,d4,snap):
-    c,p=d5.iloc[-1],d5.iloc[-2]; hi=d5.high.shift(1).rolling(18).max().iloc[-1]; lo=d5.low.shift(1).rolling(18).min().iloc[-1]
+    c=d5.iloc[-1]; c15=d15.iloc[-1]
+    hi=d5.high.shift(1).rolling(24).max().iloc[-1]; lo=d5.low.shift(1).rolling(24).min().iloc[-1]
+    a=max(float(c.atr),1e-9); body=max(abs(float(c.close-c.open)),a*.03)
+    lower_wick=max(0.0,min(float(c.open),float(c.close))-float(c.low))
+    upper_wick=max(0.0,float(c.high)-max(float(c.open),float(c.close)))
+    vol=float(c.volume_ratio) if finite(c.volume_ratio) else 0.0
     if c.low<lo and c.close>lo and c.close>c.open:
-        depth=(lo-c.low)/c.atr if c.atr else 0; return 'LONG','LOW_SWEEP_RECLAIM',max(float(c.atr*1.35),float(c.close-c.low)),20+min(5,depth*10)
+        depth=(lo-c.low)/a; reclaim=(c.close-lo)/a; wick=lower_wick/body
+        quality=(depth>=.08 and reclaim>=.08 and wick>=1.15 and vol>=.75 and c.rsi>=38 and c15.close>=c15.ema20*.992)
+        if quality:
+            trig=min(25,17+min(3,depth*6)+min(3,reclaim*5)+min(2,wick/2))
+            return 'LONG','SMC_SWEEP_RECLAIM_CONFIRMED',max(float(c.atr*1.45),float(c.close-c.low)),trig
     if c.high>hi and c.close<hi and c.close<c.open:
-        depth=(c.high-hi)/c.atr if c.atr else 0; return 'SHORT','HIGH_SWEEP_REJECT',max(float(c.atr*1.35),float(c.high-c.close)),20+min(5,depth*10)
-    return None,'WAIT_LIQUIDITY_SWEEP',None,0
+        depth=(c.high-hi)/a; reclaim=(hi-c.close)/a; wick=upper_wick/body
+        quality=(depth>=.08 and reclaim>=.08 and wick>=1.15 and vol>=.75 and c.rsi<=62 and c15.close<=c15.ema20*1.008)
+        if quality:
+            trig=min(25,17+min(3,depth*6)+min(3,reclaim*5)+min(2,wick/2))
+            return 'SHORT','SMC_SWEEP_REJECT_CONFIRMED',max(float(c.atr*1.45),float(c.high-c.close)),trig
+    return None,'WAIT_QUALITY_LIQUIDITY_SWEEP',None,0
+
 
 def detect_ema(d5,d15,d1,d4,snap):
-    c,p=d5.iloc[-1],d5.iloc[-2]
-    long_retest=p.low<=p.ema21*1.0015 and c.close>c.ema9>c.ema21 and c.close>p.close
-    short_retest=p.high>=p.ema21*.9985 and c.close<c.ema9<c.ema21 and c.close<p.close
-    if long_retest and c.rsi>=48:return 'LONG','EMA_PULLBACK_RECLAIM',float(c.atr*1.25),22
-    if short_retest and c.rsi<=52:return 'SHORT','EMA_PULLBACK_REJECT',float(c.atr*1.25),22
-    return None,'WAIT_EMA_RETEST',None,0
+    c,p=d5.iloc[-1],d5.iloc[-2]; h=d15.iloc[-1]
+    vol=float(c.volume_ratio) if finite(c.volume_ratio) else 0.0
+    long_trend=h.ema9>h.ema21 and h.ema20_slope3>0
+    short_trend=h.ema9<h.ema21 and h.ema20_slope3<0
+    long_retest=p.low<=p.ema21*1.0018 and c.close>c.ema9>c.ema21 and c.close>p.high and c.close>c.open
+    short_retest=p.high>=p.ema21*.9982 and c.close<c.ema9<c.ema21 and c.close<p.low and c.close<c.open
+    if long_trend and long_retest and c.rsi>=50 and vol>=.70:
+        return 'LONG','EMA_RETEST_RESUMPTION',float(c.atr*1.35),24
+    if short_trend and short_retest and c.rsi<=50 and vol>=.70:
+        return 'SHORT','EMA_RETEST_RESUMPTION',float(c.atr*1.35),24
+    return None,'WAIT_QUALITY_EMA_RETEST',None,0
+
 
 def detect_momentum(d5,d15,d1,d4,snap):
-    c,p=d5.iloc[-1],d5.iloc[-2]; recent=d5.iloc[-5:-1]
-    prior_up=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi>=54)).any())
-    prior_dn=bool(((recent.body_atr>=.40)&(recent.volume_ratio>=.95)&(recent.rsi<=46)).any())
-    # Current bar must confirm continuation; a stale impulse alone can no longer trigger.
-    cur_quality=finite(c.body_atr) and finite(c.volume_ratio) and c.body_atr>=.25 and c.volume_ratio>=.80
-    if prior_up and cur_quality and c.close>c.open and c.close>c.ema9 and c.close>p.close and c.rsi>=52:
-        return 'LONG','MOMENTUM_CONFIRMED_CONTINUATION',float(c.atr*1.40),23
-    if prior_dn and cur_quality and c.close<c.open and c.close<c.ema9 and c.close<p.close and c.rsi<=48:
-        return 'SHORT','MOMENTUM_CONFIRMED_CONTINUATION',float(c.atr*1.40),23
-    return None,'WAIT_MOMENTUM',None,0
+    c,p=d5.iloc[-1],d5.iloc[-2]; h=d15.iloc[-1]
+    vol=float(c.volume_ratio) if finite(c.volume_ratio) else 0.0
+    body=float(c.body_atr) if finite(c.body_atr) else 0.0
+    long_ok=(c.close>c.open and c.close>p.high and c.close>c.ema9>c.ema20 and
+             h.ema9>=h.ema20 and c.rsi>=55 and body>=.38 and vol>=.95)
+    short_ok=(c.close<c.open and c.close<p.low and c.close<c.ema9<c.ema20 and
+              h.ema9<=h.ema20 and c.rsi<=45 and body>=.38 and vol>=.95)
+    if long_ok:return 'LONG','MOMENTUM_ACCELERATION',float(c.atr*1.50),25
+    if short_ok:return 'SHORT','MOMENTUM_ACCELERATION',float(c.atr*1.50),25
+    return None,'WAIT_CURRENT_MOMENTUM_ACCELERATION',None,0
+
 
 def detect_breakout(d5,d15,d1,d4,snap):
-    c,p=d15.iloc[-1],d15.iloc[-2]; hi=d15.high.shift(2).rolling(8).max().iloc[-1]; lo=d15.low.shift(2).rolling(8).min().iloc[-1]
-    long_retest=p.close>hi and c.low<=hi*1.002 and c.close>hi
-    short_retest=p.close<lo and c.high>=lo*.998 and c.close<lo
-    if long_retest:return 'LONG','BREAKOUT_RETEST_ACCEPT',float(c.atr*1.70),24
-    if short_retest:return 'SHORT','BREAKOUT_RETEST_ACCEPT',float(c.atr*1.70),24
-    return None,'WAIT_BREAKOUT_RETEST',None,0
+    c,p=d15.iloc[-1],d15.iloc[-2]
+    hi=d15.high.shift(2).rolling(10).max().iloc[-1]; lo=d15.low.shift(2).rolling(10).min().iloc[-1]
+    a=max(float(c.atr),1e-9); vol=float(c.volume_ratio) if finite(c.volume_ratio) else 0.0
+    # Breakout detector is allowed to anticipate regime expansion: trigger quality is primary.
+    long_break=p.close>hi and (p.close-hi)/a>=.08
+    short_break=p.close<lo and (lo-p.close)/a>=.08
+    long_accept=long_break and c.low<=hi*1.0025 and c.close>hi and c.close>c.open and c.rsi>=50
+    short_accept=short_break and c.high>=lo*.9975 and c.close<lo and c.close<c.open and c.rsi<=50
+    if long_accept and vol>=.70:return 'LONG','BREAKOUT_RETEST_ACCEPTED',float(c.atr*1.65),25
+    if short_accept and vol>=.70:return 'SHORT','BREAKOUT_RETEST_ACCEPTED',float(c.atr*1.65),25
+    return None,'WAIT_BREAKOUT_ACCEPTANCE',None,0
+
 
 def detect_trend_pullback(d5,d15,d1,d4,snap):
-    c=d15.iloc[-1]; h=d1.iloc[-1]; recent=d15.iloc[-4:-1]
-    bull=bool(h.ema20>h.ema50 and h.ema20_slope3>0)
-    bear=bool(h.ema20<h.ema50 and h.ema20_slope3<0)
-    # A pullback may occur over several 15m candles; require current candle to resume.
-    bull_touch=bool((recent.low<=recent.ema20*1.003).any())
-    bear_touch=bool((recent.high>=recent.ema20*.997).any())
-    bull_resume=bool(c.close>c.open and c.close>c.ema20 and c.close>c.ema9 and c.rsi>=50)
-    bear_resume=bool(c.close<c.open and c.close<c.ema20 and c.close<c.ema9 and c.rsi<=50)
-    if bull and bull_touch and bull_resume:return 'LONG','HTF_PULLBACK_RESUME',float(c.atr*1.65),24
-    if bear and bear_touch and bear_resume:return 'SHORT','HTF_PULLBACK_RESUME',float(c.atr*1.65),24
-    return None,'WAIT_HTF_PULLBACK',None,0
+    c=d15.iloc[-1]; h=d1.iloc[-1]; recent=d15.iloc[-5:-1]
+    bull=h.ema20>h.ema50 and h.ema20_slope3>0
+    bear=h.ema20<h.ema50 and h.ema20_slope3<0
+    bull_touch=bool((recent.low<=recent.ema20*1.004).any())
+    bear_touch=bool((recent.high>=recent.ema20*.996).any())
+    bull_resume=c.close>c.open and c.close>c.ema9 and c.close>c.ema20 and c.rsi>=52
+    bear_resume=c.close<c.open and c.close<c.ema9 and c.close<c.ema20 and c.rsi<=48
+    if bull and bull_touch and bull_resume:return 'LONG','HTF_PULLBACK_CONFIRMED_RESUME',float(c.atr*1.70),24
+    if bear and bear_touch and bear_resume:return 'SHORT','HTF_PULLBACK_CONFIRMED_RESUME',float(c.atr*1.70),24
+    return None,'WAIT_HTF_PULLBACK_RESUMPTION',None,0
+
 
 def detect_mean_reversion(d5,d15,d1,d4,snap):
-    c=d5.iloc[-1]; z=(c.close-c.ema20)/c.atr if c.atr else 0
-    if z<-1.7 and c.rsi<32 and c.close>c.open:return 'LONG','RANGE_EXTREME_SNAPBACK',float(c.atr*1.45),22
-    if z>1.7 and c.rsi>68 and c.close<c.open:return 'SHORT','RANGE_EXTREME_SNAPBACK',float(c.atr*1.45),22
-    return None,'WAIT_RANGE_EXTREME',None,0
+    c=d5.iloc[-1]; h=d15.iloc[-1]
+    z=(c.close-c.ema20)/c.atr if c.atr else 0
+    flat15=abs(float(h.ema20_slope3))<=.0035 if finite(h.ema20_slope3) else False
+    vol=float(c.volume_ratio) if finite(c.volume_ratio) else 0.0
+    if flat15 and z<-1.8 and c.rsi<31 and c.close>c.open and vol>=.65:
+        return 'LONG','RANGE_EXTREME_REJECTION',float(c.atr*1.50),24
+    if flat15 and z>1.8 and c.rsi>69 and c.close<c.open and vol>=.65:
+        return 'SHORT','RANGE_EXTREME_REJECTION',float(c.atr*1.50),24
+    return None,'WAIT_CONFIRMED_RANGE_EXTREME',None,0
+
 
 DETECTORS={'SMC_SWEEP':detect_smc,'EMA_SCALP':detect_ema,'MOMENTUM':detect_momentum,
            'BREAKOUT':detect_breakout,'TREND_PULLBACK':detect_trend_pullback,'MEAN_REVERSION':detect_mean_reversion}
 
-DECISION_COLUMNS=['schema_version','candidate_id','time','strategy','side','setup','regime','direction','strength','volatility','market_state','run_mode','context_fit','context_reason','score_pass',
+DECISION_COLUMNS=['schema_version','candidate_id','time','strategy','side','setup','regime','direction','strength','volatility','market_state','run_mode','context_fit','context_reason','score_pass','detector_quality',
  'price','rsi_5m','adx_1h','er24_1h','vol_ratio_1h','atr_pct_5m','body_atr_5m','volume_ratio_5m','volume_ratio_15m',
  'ema20_slope3_15m','ema20_slope3_1h','ema20_slope3_4h','trend_aligned','countertrend','smc_sweep_depth_atr','smc_reclaim_quality','smc_wick_body_ratio','score_total','score_trend','score_regime','score_trigger',
  'score_momentum','score_volume','score_structure','estimated_cost_R','initial_rr','router_allowed','router_reason','decision','open_risk_pct']
@@ -319,8 +352,8 @@ EVENT_COLUMNS=['schema_version','candidate_id','time','strategy','event','price'
 SHADOW_COLUMNS=['schema_version','candidate_id','strategy','side','setup','decision','block_reason','entry_time','finish_time','entry',
  'stop','target','MFE_R','MAE_R','first_touch','bars','regime','score_total']
 
-EVENTS_FILE=os.path.join(DATA_DIR,'btc_v173_management_events.csv')
-SHADOW_FILE=os.path.join(DATA_DIR,'btc_v173_shadow_outcomes.csv')
+EVENTS_FILE=os.path.join(DATA_DIR,'btc_v174_management_events.csv')
+SHADOW_FILE=os.path.join(DATA_DIR,'btc_v174_shadow_outcomes.csv')
 
 def append_fixed(path,row,columns):
     clean={k:row.get(k) for k in columns}
@@ -340,7 +373,7 @@ def signal_for(key,c,snap):
     d5,d15,d1,d4=frames(c)
     if min(len(d15),len(d1),len(d4))<200:return None
     side,setup,dist,trigger=DETECTORS[key](d5,d15,d1,d4,snap)
-    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='4.0'
+    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='5.0'
     if not side:return {'signal':None,'time':d5.index[-1],'reason':setup,'features':feat}
     c5=d5.iloc[-1]
     # V1.7.2 diagnostics: measure hypotheses without using them as hard research filters.
@@ -370,15 +403,25 @@ def signal_for(key,c,snap):
     feat['estimated_cost_R']=est; feat['initial_rr']=STRATEGIES[key]['rr']
     context_fit,context_reason=router(key,side,snap)
     score_pass=bool(scores['score_total']>=MIN_SCORE)
+    # Detector quality is independent of the regime label. Trigger contributes 25 points max.
+    detector_quality=max(0.0,min(1.0,float(trigger)/25.0))
+    feat['detector_quality']=detector_quality
     feat['run_mode']=RUN_MODE; feat['context_fit']=context_fit; feat['context_reason']=context_reason; feat['score_pass']=score_pass
+    hard_context=(not context_fit)
+    soft_mismatch=(context_reason=='SOFT_CONTEXT_MISMATCH')
+    cost_ok=est<=MAX_LIVE_COST_R+1e-12
     if RESEARCH_MODE:
-        # V1.7.3: do not burn the live research account on candidates outside the strategy mandate.
-        # They remain observable through the shadow engine. Score stays advisory until validated OOS.
-        allowed=context_fit
-        why='RESEARCH_CONTEXT_OK' if context_fit else context_reason
+        # Hard invalid contexts remain shadow-only. Soft regime mismatch may execute when
+        # the strategy-specific detector itself is strong; this avoids one slow label vetoing a strong trigger.
+        allowed=(not hard_context) and cost_ok and detector_quality>=LIVE_MIN_QUALITY and (not soft_mismatch or detector_quality>=SOFT_CONTEXT_MIN_QUALITY)
+        if not cost_ok: why='LIVE_COST_TOO_HIGH'
+        elif hard_context: why=context_reason
+        elif detector_quality<LIVE_MIN_QUALITY: why='DETECTOR_QUALITY_LOW'
+        elif soft_mismatch and detector_quality<SOFT_CONTEXT_MIN_QUALITY: why='SOFT_CONTEXT_NEEDS_STRONG_TRIGGER'
+        else: why='RESEARCH_QUALITY_OK'
     else:
-        allowed=context_fit and score_pass
-        why=context_reason if not context_fit else ('SCORE_BELOW_BASELINE' if not score_pass else 'CONTEXT_OK')
+        allowed=(not hard_context) and cost_ok and score_pass and detector_quality>=LIVE_MIN_QUALITY
+        why='PRODUCTION_OK' if allowed else (context_reason if hard_context else 'QUALITY_SCORE_OR_COST_BLOCK')
     feat['router_allowed']=allowed;feat['router_reason']=why
     return {'signal':side,'time':d5.index[-1],'entry':entry,'stop_distance':dist,'reason':setup,'allowed':allowed,
             'router_reason':why,'context_fit':context_fit,'context_reason':context_reason,'score_pass':score_pass,
@@ -408,7 +451,7 @@ def update_shadows(state,bar):
         elif tp_hit:x['first_touch']='TARGET'
         if x['first_touch']!='NONE' or x['bars']>=96:
             if x['first_touch']=='NONE':x['first_touch']='TIME'
-            append_fixed(SHADOW_FILE,{**x,'schema_version':'4.0','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
+            append_fixed(SHADOW_FILE,{**x,'schema_version':'5.0','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
     for cid in done:state['shadow_candidates'].pop(cid,None)
 
 def is_cooldown(s,now=None):
@@ -475,7 +518,7 @@ def open_position(key,state,s,sig):
     s['position']=p;s['signals']+=1;s['last_signal']=f"{side} · {sig['reason']}";s['last_signal_time']=sig['time'].isoformat()
     append_entry({**sig['features'],'entry':entry,'initial_stop':stop,'initial_target':target,'stop_distance':dist,
                   'stop_pct':dist/entry,'risk_eur':risk_eur,'qty':qty,'notional':notional})
-    log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
+    log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
                'price':entry,'r_value':0,'old_stop':stop,'new_stop':stop,'detail':f"risk_pct={risk_pct:.4f}"})
     print(f'[ENTRY][{key}] {side} {entry:.2f} stop={stop:.2f} tp={target:.2f} score={sig.get("score"):.0f}',flush=True)
 
@@ -490,12 +533,12 @@ def close_position(key,state,s,exit_price,exit_time,reason):
         state['losing_trades']+=1;state['gross_loss']+=abs(pnl);s['loss_streak']+=1
         if (not RESEARCH_MODE) and s['loss_streak']>=COOLDOWN_AFTER_LOSSES:s['cooldown_until']=(exit_time+timedelta(hours=COOLDOWN_HOURS)).isoformat()
     giveback=max(0,float(p.get('mfe_r',0))-raw_r)
-    append_fixed(TRADES_FILE,{'schema_version':'4.0','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
+    append_fixed(TRADES_FILE,{'schema_version':'5.0','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
       'exit_time':exit_time.isoformat(),'side':p['side'],'setup':p['setup'],'regime':p.get('regime'),'score_total':p.get('score_total'),
       'entry':p['entry_price'],'exit':exit_price,'initial_stop':p['initial_stop'],'final_stop':p['stop'],'target':p['target'],
       'raw_R':raw_r,'net_R':net_r,'reason':reason,'gross_pnl_eur':gross,'fees_eur':fee,'slippage_eur':slip,'pnl_eur':pnl,
       'balance':s['balance'],'MFE_R':p['mfe_r'],'MAE_R':p['mae_r'],'giveback_R':giveback,'bars_held':p.get('bars_held',0)},TRADE_COLUMNS)
-    log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
+    log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
                'price':exit_price,'r_value':raw_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':reason})
     s['position']=None;print(f'[EXIT][{key}] {reason} rawR={raw_r:.2f} netR={net_r:.2f}',flush=True)
 
@@ -505,7 +548,7 @@ def move_stop(key,p,t,new_stop,event,r_value):
     else:new_stop=min(old,new_stop)
     if abs(new_stop-old)>1e-9:
         p['stop']=new_stop
-        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
+        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
                    'price':None,'r_value':r_value,'old_stop':old,'new_stop':new_stop,'detail':''})
 
 def check_position(key,state,s,candle):
@@ -520,12 +563,12 @@ def check_position(key,state,s,candle):
         tag=f'{level:.2f}R'
         if p['mfe_r']>=level and tag not in seen:
             seen.add(tag)
-            log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,
+            log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,
                        'event':'MFE_MILESTONE','price':cl,'r_value':level,'old_stop':p['stop'],'new_stop':p['stop'],'detail':tag})
     p['milestones_seen']=sorted(seen)
     stop_hit=l<=p['stop'] if p['side']=='LONG' else h>=p['stop'];tp_hit=h>=p['target'] if p['side']=='LONG' else l<=p['target']
     if stop_hit and tp_hit:
-        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
+        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
                    'price':cl,'r_value':None,'old_stop':p['stop'],'new_stop':p['stop'],'detail':'stop_and_target_same_5m_bar; conservative stop-first'})
         return close_position(key,state,s,p['stop'],t,'AMBIGUOUS_STOP_FIRST')
     if stop_hit:return close_position(key,state,s,p['stop'],t,'STOP' if p.get('protected_stage',0)==0 else 'PROTECTED_STOP')
@@ -536,11 +579,11 @@ def check_position(key,state,s,candle):
     prev_state=p.get('exit_state','UNPROTECTED')
     if mfe>=PROFIT_ZONE_R and not p.get('profit_zone_seen'):
         p['profit_zone_seen']=True;p['exit_state']='PROFIT_ZONE'
-        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'PROFIT_ZONE_ENTERED','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'mfe={mfe:.2f}'})
+        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'PROFIT_ZONE_ENTERED','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'mfe={mfe:.2f}'})
     # Confirmed-close protection: only a completed 5m close >= threshold can arm it.
     # This avoids retroactive intrabar assumptions and targets the observed +R -> full-loss leakage.
     if close_r>=CONFIRMED_PROFIT_CLOSE_R and p.get('protected_stage',0)<1:
-        cushion=min(.22,max(.05,float(p.get('estimated_cost_R') or .10)+.02))
+        cushion=min(.35,max(.10,float(p.get('estimated_cost_R') or .10)+.06))
         ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
         move_stop(key,p,t,ns,'CONFIRMED_PROFIT_PROTECT',close_r);p['protected_stage']=1;p['exit_state']='PROTECTED'
     # Deterioration = meaningful giveback after a useful excursion plus weak close. Protect modestly, never widen risk.
@@ -548,7 +591,7 @@ def check_position(key,state,s,candle):
     deterioration=(mfe>=DYNAMIC_PROTECT_R and giveback>=DETERIORATION_GIVEBACK_R and close_r<=DETERIORATION_CLOSE_R)
     if deterioration and p.get('protected_stage',0)<1:
         # Lock around cost-aware scratch rather than forcing BE on every +0.5R trade.
-        cushion=min(.22,max(.05,float(p.get('estimated_cost_R') or .10)+.02))
+        cushion=min(.35,max(.10,float(p.get('estimated_cost_R') or .10)+.06))
         ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
         move_stop(key,p,t,ns,'DETERIORATION_PROTECT',close_r);p['protected_stage']=1;p['exit_state']='PROTECTED'
     if mfe>=TRAIL_TRIGGER_R and close_r>=1.0:
@@ -563,7 +606,7 @@ def check_position(key,state,s,candle):
         ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
         move_stop(key,p,t,ns,'BE_ARMED',close_r);p['protected_stage']=1;p['exit_state']='PROTECTED'
     if p.get('exit_state')!=prev_state:
-        log_event({'schema_version':'4.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'EXIT_STATE_CHANGE','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'{prev_state}->{p.get("exit_state")};mfe={mfe:.2f};giveback={giveback:.2f}'})
+        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'EXIT_STATE_CHANGE','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'{prev_state}->{p.get("exit_state")};mfe={mfe:.2f};giveback={giveback:.2f}'})
 
     # Strategy invalidation on confirmed close, not on a wick.
     if key=='BREAKOUT' and p['bars_held']>=2:
@@ -672,26 +715,26 @@ def dashboard():
     return render_template_string(DASH,s=stats(st),r=r,strat=strategy_dashboard(st),openpos=open_positions_dashboard(st,price),decisions=_read_csv_records(DECISIONS_FILE,36),regimes=regime_performance(),recent=recent())
 @app.get('/api/status')
 def status():
-    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.7.3-RESEARCH','run_mode':RUN_MODE,'stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
+    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.7.4-RESEARCH','run_mode':RUN_MODE,'stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
 def dl(path,name):
     if not os.path.exists(path):return {'error':'Nog geen bestand.'},404
     return send_file(path,mimetype='text/csv',as_attachment=True,download_name=name)
 @app.get('/download/trades')
-def d1():return dl(TRADES_FILE,'btc_v173_trades.csv')
+def d1():return dl(TRADES_FILE,'btc_v174_trades.csv')
 @app.get('/download/features')
-def d2():return dl(FEATURES_FILE,'btc_v173_entries.csv')
+def d2():return dl(FEATURES_FILE,'btc_v174_entries.csv')
 @app.get('/download/decisions')
-def d3():return dl(DECISIONS_FILE,'btc_v173_decisions.csv')
+def d3():return dl(DECISIONS_FILE,'btc_v174_decisions.csv')
 @app.get('/download/events')
-def d4():return dl(EVENTS_FILE,'btc_v173_management_events.csv')
+def d4():return dl(EVENTS_FILE,'btc_v174_management_events.csv')
 @app.get('/download/shadow')
-def d5():return dl(SHADOW_FILE,'btc_v173_shadow_outcomes.csv')
+def d5():return dl(SHADOW_FILE,'btc_v174_shadow_outcomes.csv')
 @app.get('/health')
-def health():return {'status':'ok','version':'BTC-V1.7.3-RESEARCH','run_mode':RUN_MODE,'risk_per_trade':RISK_PER_TRADE},200
+def health():return {'status':'ok','version':'BTC-V1.7.4-RESEARCH','run_mode':RUN_MODE,'risk_per_trade':RISK_PER_TRADE},200
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),threaded=True,use_reloader=False)
 
 def main():
-    threading.Thread(target=run_dashboard,daemon=True).start();print(f'BTC V1.7.3 RESEARCH — PAPER ONLY — mode={RUN_MODE} — independent strategy accounts — risk/trade={RISK_PER_TRADE:.2%}',flush=True)
+    threading.Thread(target=run_dashboard,daemon=True).start();print(f'BTC V1.7.4 RESEARCH — PAPER ONLY — mode={RUN_MODE} — quality-gated independent strategy accounts — risk/trade={RISK_PER_TRADE:.2%}',flush=True)
     state=load_state();candles=update_candles(load_candles())
     while True:
         try:
