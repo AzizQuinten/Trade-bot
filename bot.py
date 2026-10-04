@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-# BTC V1.7.4 RESEARCH — independent paper account per strategy
+# BTC V1.7.5 RESEARCH — independent paper account per strategy
 INST_ID = os.getenv('INST_ID', 'BTC-USDT')
 START_BALANCE = float(os.getenv('START_BALANCE', '500'))
 RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
@@ -46,11 +46,11 @@ DATA_DIR = os.getenv('DATA_DIR', '/data')
 try: os.makedirs(DATA_DIR, exist_ok=True)
 except PermissionError:
     DATA_DIR = './data'; os.makedirs(DATA_DIR, exist_ok=True)
-STATE_FILE = os.path.join(DATA_DIR, 'btc_v174_state.json')
-TRADES_FILE = os.path.join(DATA_DIR, 'btc_v174_trades.csv')
-FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v174_entries.csv')
-DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v174_decisions.csv')
-CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v174_candles_5m.csv')
+STATE_FILE = os.path.join(DATA_DIR, 'btc_v175_state.json')
+TRADES_FILE = os.path.join(DATA_DIR, 'btc_v175_trades.csv')
+FEATURES_FILE = os.path.join(DATA_DIR, 'btc_v175_entries.csv')
+DECISIONS_FILE = os.path.join(DATA_DIR, 'btc_v175_decisions.csv')
+CANDLES_FILE = os.path.join(DATA_DIR, 'btc_v175_candles_5m.csv')
 
 STRATEGIES = {
  'SMC_SWEEP': {'label':'Liquidity Sweep / Reversal','rr':2.5,'stop_atr':1.35,'max_hours':6,'enabled':True},
@@ -62,7 +62,7 @@ STRATEGIES = {
 }
 
 
-session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.7.4-RESEARCH'})
+session=requests.Session(); session.headers.update({'User-Agent':'BTC-V1/1.7.5-RESEARCH'})
 state_lock=threading.RLock()
 def utc_now(): return datetime.now(timezone.utc)
 def finite(x):
@@ -72,7 +72,7 @@ def finite(x):
 def strategy_default():
     return {'position':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'risk_day':None,'day_start_balance':START_BALANCE,'loss_streak':0,'cooldown_until':None,'scans':0,'signals':0,'blocked':0,'last_signal':'—','last_signal_time':None}
 def default_state():
-    return {'version':'BTC-V1.7.4-RESEARCH','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
+    return {'version':'BTC-V1.7.5-RESEARCH','created':utc_now().isoformat(),'last_processed_5m':None,'balance':START_BALANCE,'peak_balance':START_BALANCE,'max_drawdown':0.0,'total_trades':0,'winning_trades':0,'losing_trades':0,'gross_profit':0.0,'gross_loss':0.0,'global_loss_streak':0,'risk_day':None,'day_start_balance':START_BALANCE,'shadow_candidates':{},'strategies':{k:strategy_default() for k in STRATEGIES}}
 def normalize_state(s):
     base=default_state()
     for k,v in base.items(): s.setdefault(k,v)
@@ -340,7 +340,7 @@ def detect_mean_reversion(d5,d15,d1,d4,snap):
 DETECTORS={'SMC_SWEEP':detect_smc,'EMA_SCALP':detect_ema,'MOMENTUM':detect_momentum,
            'BREAKOUT':detect_breakout,'TREND_PULLBACK':detect_trend_pullback,'MEAN_REVERSION':detect_mean_reversion}
 
-DECISION_COLUMNS=['schema_version','candidate_id','time','strategy','side','setup','regime','direction','strength','volatility','market_state','run_mode','context_fit','context_reason','score_pass','detector_quality',
+DECISION_COLUMNS=['schema_version','candidate_id','time','strategy','side','setup','regime','direction','strength','volatility','market_state','run_mode','context_fit','context_reason','score_pass','detector_quality','cost_pass','quality_pass','soft_context_mismatch',
  'price','rsi_5m','adx_1h','er24_1h','vol_ratio_1h','atr_pct_5m','body_atr_5m','volume_ratio_5m','volume_ratio_15m',
  'ema20_slope3_15m','ema20_slope3_1h','ema20_slope3_4h','trend_aligned','countertrend','smc_sweep_depth_atr','smc_reclaim_quality','smc_wick_body_ratio','score_total','score_trend','score_regime','score_trigger',
  'score_momentum','score_volume','score_structure','estimated_cost_R','initial_rr','router_allowed','router_reason','decision','open_risk_pct']
@@ -352,8 +352,8 @@ EVENT_COLUMNS=['schema_version','candidate_id','time','strategy','event','price'
 SHADOW_COLUMNS=['schema_version','candidate_id','strategy','side','setup','decision','block_reason','entry_time','finish_time','entry',
  'stop','target','MFE_R','MAE_R','first_touch','bars','regime','score_total']
 
-EVENTS_FILE=os.path.join(DATA_DIR,'btc_v174_management_events.csv')
-SHADOW_FILE=os.path.join(DATA_DIR,'btc_v174_shadow_outcomes.csv')
+EVENTS_FILE=os.path.join(DATA_DIR,'btc_v175_management_events.csv')
+SHADOW_FILE=os.path.join(DATA_DIR,'btc_v175_shadow_outcomes.csv')
 
 def append_fixed(path,row,columns):
     clean={k:row.get(k) for k in columns}
@@ -373,7 +373,7 @@ def signal_for(key,c,snap):
     d5,d15,d1,d4=frames(c)
     if min(len(d15),len(d1),len(d4))<200:return None
     side,setup,dist,trigger=DETECTORS[key](d5,d15,d1,d4,snap)
-    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='5.0'
+    feat=base_features(key,side,setup,d5,d15,d1,d4,snap); feat['schema_version']='6.0'
     if not side:return {'signal':None,'time':d5.index[-1],'reason':setup,'features':feat}
     c5=d5.iloc[-1]
     # V1.7.2 diagnostics: measure hypotheses without using them as hard research filters.
@@ -410,14 +410,18 @@ def signal_for(key,c,snap):
     hard_context=(not context_fit)
     soft_mismatch=(context_reason=='SOFT_CONTEXT_MISMATCH')
     cost_ok=est<=MAX_LIVE_COST_R+1e-12
+    feat['cost_pass']=bool(cost_ok)
+    feat['quality_pass']=bool(detector_quality>=LIVE_MIN_QUALITY)
+    feat['soft_context_mismatch']=bool(soft_mismatch)
     if RESEARCH_MODE:
-        # Hard invalid contexts remain shadow-only. Soft regime mismatch may execute when
-        # the strategy-specific detector itself is strong; this avoids one slow label vetoing a strong trigger.
-        allowed=(not hard_context) and cost_ok and detector_quality>=LIVE_MIN_QUALITY and (not soft_mismatch or detector_quality>=SOFT_CONTEXT_MIN_QUALITY)
-        if not cost_ok: why='LIVE_COST_TOO_HIGH'
-        elif hard_context: why=context_reason
+        # V1.7.5: estimated costs are logged and charged to net_R, but do not censor a
+        # technically valid paper-research signal. This lets us measure whether the cost
+        # hypothesis truly separates good/bad trades instead of throwing the sample away.
+        allowed=(not hard_context) and detector_quality>=LIVE_MIN_QUALITY and (not soft_mismatch or detector_quality>=SOFT_CONTEXT_MIN_QUALITY)
+        if hard_context: why=context_reason
         elif detector_quality<LIVE_MIN_QUALITY: why='DETECTOR_QUALITY_LOW'
         elif soft_mismatch and detector_quality<SOFT_CONTEXT_MIN_QUALITY: why='SOFT_CONTEXT_NEEDS_STRONG_TRIGGER'
+        elif not cost_ok: why='RESEARCH_EXECUTE_HIGH_COST_MEASURED'
         else: why='RESEARCH_QUALITY_OK'
     else:
         allowed=(not hard_context) and cost_ok and score_pass and detector_quality>=LIVE_MIN_QUALITY
@@ -451,7 +455,7 @@ def update_shadows(state,bar):
         elif tp_hit:x['first_touch']='TARGET'
         if x['first_touch']!='NONE' or x['bars']>=96:
             if x['first_touch']=='NONE':x['first_touch']='TIME'
-            append_fixed(SHADOW_FILE,{**x,'schema_version':'5.0','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
+            append_fixed(SHADOW_FILE,{**x,'schema_version':'6.0','finish_time':pd.Timestamp(bar.timestamp).isoformat()},SHADOW_COLUMNS);done.append(cid)
     for cid in done:state['shadow_candidates'].pop(cid,None)
 
 def is_cooldown(s,now=None):
@@ -501,7 +505,10 @@ def validate_order_candidate(key,sig):
         if not finite(entry) or not finite(dist) or entry<=0 or dist<=0:return False,'INVALID_ENTRY_OR_STOP_DISTANCE'
         if dist/entry<=0 or dist/entry>=0.10:return False,'IMPLAUSIBLE_STOP_DISTANCE'
         est=float(sig.get('estimated_cost_R') or 0)
-        if not finite(est) or est<0 or est>MAX_COST_R+1e-9:return False,'COST_MODEL_BREACH'
+        if not finite(est) or est<0:return False,'INVALID_COST_MODEL'
+        # A very high cost estimate can indicate corrupt geometry; normal research cost
+        # threshold breaches are measured, not blocked.
+        if est>2.0:return False,'IMPLAUSIBLE_COST_MODEL'
         if key not in STRATEGIES:return False,'UNKNOWN_STRATEGY'
         return True,'ORDER_SANITY_OK'
     except Exception:
@@ -518,7 +525,7 @@ def open_position(key,state,s,sig):
     s['position']=p;s['signals']+=1;s['last_signal']=f"{side} · {sig['reason']}";s['last_signal_time']=sig['time'].isoformat()
     append_entry({**sig['features'],'entry':entry,'initial_stop':stop,'initial_target':target,'stop_distance':dist,
                   'stop_pct':dist/entry,'risk_eur':risk_eur,'qty':qty,'notional':notional})
-    log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
+    log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':p['entry_time'],'strategy':key,'event':'OPEN',
                'price':entry,'r_value':0,'old_stop':stop,'new_stop':stop,'detail':f"risk_pct={risk_pct:.4f}"})
     print(f'[ENTRY][{key}] {side} {entry:.2f} stop={stop:.2f} tp={target:.2f} score={sig.get("score"):.0f}',flush=True)
 
@@ -533,12 +540,12 @@ def close_position(key,state,s,exit_price,exit_time,reason):
         state['losing_trades']+=1;state['gross_loss']+=abs(pnl);s['loss_streak']+=1
         if (not RESEARCH_MODE) and s['loss_streak']>=COOLDOWN_AFTER_LOSSES:s['cooldown_until']=(exit_time+timedelta(hours=COOLDOWN_HOURS)).isoformat()
     giveback=max(0,float(p.get('mfe_r',0))-raw_r)
-    append_fixed(TRADES_FILE,{'schema_version':'5.0','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
+    append_fixed(TRADES_FILE,{'schema_version':'6.0','candidate_id':p['candidate_id'],'strategy':key,'entry_time':p['entry_time'],
       'exit_time':exit_time.isoformat(),'side':p['side'],'setup':p['setup'],'regime':p.get('regime'),'score_total':p.get('score_total'),
       'entry':p['entry_price'],'exit':exit_price,'initial_stop':p['initial_stop'],'final_stop':p['stop'],'target':p['target'],
       'raw_R':raw_r,'net_R':net_r,'reason':reason,'gross_pnl_eur':gross,'fees_eur':fee,'slippage_eur':slip,'pnl_eur':pnl,
       'balance':s['balance'],'MFE_R':p['mfe_r'],'MAE_R':p['mae_r'],'giveback_R':giveback,'bars_held':p.get('bars_held',0)},TRADE_COLUMNS)
-    log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
+    log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':exit_time.isoformat(),'strategy':key,'event':'EXIT',
                'price':exit_price,'r_value':raw_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':reason})
     s['position']=None;print(f'[EXIT][{key}] {reason} rawR={raw_r:.2f} netR={net_r:.2f}',flush=True)
 
@@ -548,7 +555,7 @@ def move_stop(key,p,t,new_stop,event,r_value):
     else:new_stop=min(old,new_stop)
     if abs(new_stop-old)>1e-9:
         p['stop']=new_stop
-        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
+        log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':event,
                    'price':None,'r_value':r_value,'old_stop':old,'new_stop':new_stop,'detail':''})
 
 def check_position(key,state,s,candle):
@@ -563,12 +570,12 @@ def check_position(key,state,s,candle):
         tag=f'{level:.2f}R'
         if p['mfe_r']>=level and tag not in seen:
             seen.add(tag)
-            log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,
+            log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,
                        'event':'MFE_MILESTONE','price':cl,'r_value':level,'old_stop':p['stop'],'new_stop':p['stop'],'detail':tag})
     p['milestones_seen']=sorted(seen)
     stop_hit=l<=p['stop'] if p['side']=='LONG' else h>=p['stop'];tp_hit=h>=p['target'] if p['side']=='LONG' else l<=p['target']
     if stop_hit and tp_hit:
-        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
+        log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'INTRABAR_AMBIGUOUS',
                    'price':cl,'r_value':None,'old_stop':p['stop'],'new_stop':p['stop'],'detail':'stop_and_target_same_5m_bar; conservative stop-first'})
         return close_position(key,state,s,p['stop'],t,'AMBIGUOUS_STOP_FIRST')
     if stop_hit:return close_position(key,state,s,p['stop'],t,'STOP' if p.get('protected_stage',0)==0 else 'PROTECTED_STOP')
@@ -579,7 +586,7 @@ def check_position(key,state,s,candle):
     prev_state=p.get('exit_state','UNPROTECTED')
     if mfe>=PROFIT_ZONE_R and not p.get('profit_zone_seen'):
         p['profit_zone_seen']=True;p['exit_state']='PROFIT_ZONE'
-        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'PROFIT_ZONE_ENTERED','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'mfe={mfe:.2f}'})
+        log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'PROFIT_ZONE_ENTERED','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'mfe={mfe:.2f}'})
     # Confirmed-close protection: only a completed 5m close >= threshold can arm it.
     # This avoids retroactive intrabar assumptions and targets the observed +R -> full-loss leakage.
     if close_r>=CONFIRMED_PROFIT_CLOSE_R and p.get('protected_stage',0)<1:
@@ -606,7 +613,7 @@ def check_position(key,state,s,candle):
         ns=p['entry_price']+cushion*p['stop_distance'] if p['side']=='LONG' else p['entry_price']-cushion*p['stop_distance']
         move_stop(key,p,t,ns,'BE_ARMED',close_r);p['protected_stage']=1;p['exit_state']='PROTECTED'
     if p.get('exit_state')!=prev_state:
-        log_event({'schema_version':'5.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'EXIT_STATE_CHANGE','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'{prev_state}->{p.get("exit_state")};mfe={mfe:.2f};giveback={giveback:.2f}'})
+        log_event({'schema_version':'6.0','candidate_id':p['candidate_id'],'time':t.isoformat(),'strategy':key,'event':'EXIT_STATE_CHANGE','price':cl,'r_value':close_r,'old_stop':p['stop'],'new_stop':p['stop'],'detail':f'{prev_state}->{p.get("exit_state")};mfe={mfe:.2f};giveback={giveback:.2f}'})
 
     # Strategy invalidation on confirmed close, not on a wick.
     if key=='BREAKOUT' and p['bars_held']>=2:
@@ -697,6 +704,23 @@ DASH='''<!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="v
 <div class="two section"><div class="card"><h2>Recente decisions / signals</h2>{% if decisions %}<div class="tablewrap"><table><tr><th>Tijd</th><th>Strategy</th><th>Side</th><th>Decision</th><th>Setup</th><th>Regime</th><th>ADX</th></tr>{% for d in decisions %}<tr><td>{{d.time[11:16] if d.time else '—'}}</td><td class="strategy">{{d.strategy}}</td><td>{{d.side}}</td><td><span class="pill {{'pos' if d.decision=='OPEN' else 'amber' if d.decision=='SHADOW' else ''}}">{{d.decision}}</span></td><td>{{d.setup}}</td><td>{{d.regime}}</td><td>{{'%.1f'|format(d.adx_1h) if d.adx_1h is not none else '—'}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen signalen gelogd.</div>{% endif %}</div><div class="card"><h2>Performance per regime</h2>{% if regimes %}<div class="tablewrap"><table><tr><th>Regime</th><th>Trades</th><th>WR</th><th>Net R</th><th>P/L</th></tr>{% for x in regimes %}<tr><td class="strategy">{{x.regime}}</td><td>{{x.trades}}</td><td>{{'%.1f'|format(x.winrate)}}%</td><td class="{{'pos' if x.net_r>0 else 'neg' if x.net_r<0 else ''}}">{{'%+.2f'|format(x.net_r)}}</td><td class="{{'pos' if x.pnl>0 else 'neg' if x.pnl<0 else ''}}">€{{'%+.2f'|format(x.pnl)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Regime-statistieken verschijnen na de eerste gesloten trades.</div>{% endif %}</div></div>
 <div class="card section"><h2>Trade history</h2>{% if recent %}<div class="tablewrap"><table><tr><th>Exit</th><th>Strategy</th><th>Side</th><th>Setup</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Gross R</th><th>Costs R</th><th>Net R</th><th>MFE</th><th>MAE</th><th>Costs €</th><th>P/L</th><th>Balance</th></tr>{% for t in recent %}<tr><td>{{t.exit_time[5:16]|replace('T',' ')}}</td><td class="strategy">{{t.strategy}}</td><td>{{t.side}}</td><td>{{t.setup}}</td><td>${{'{:,.0f}'.format(t.entry)}}</td><td>${{'{:,.0f}'.format(t.exit)}}</td><td>{{t.reason}}</td><td>{{'%+.2f'|format(t.raw_R)}}R</td><td class="amber">-{{'%.2f'|format(t.costs_R)}}R</td><td class="{{'pos' if t.net_R>=0 else 'neg'}}">{{'%+.2f'|format(t.net_R)}}R</td><td class="pos">{{'%.2f'|format(t.MFE_R)}}R</td><td class="neg">{{'%.2f'|format(t.MAE_R)}}R</td><td>€{{'%.2f'|format(t.costs_eur)}}</td><td class="{{'pos' if t.pnl_eur>=0 else 'neg'}}">€{{'%+.2f'|format(t.pnl_eur)}}</td><td>€{{'%.2f'|format(t.balance)}}</td></tr>{% endfor %}</table></div>{% else %}<div class="empty">Nog geen gesloten trades.</div>{% endif %}</div>
 <div class="card section"><h2>Data & exports</h2><div class="downloads"><a class="btn" href="/download/trades">↓ Trades CSV</a><a class="btn" href="/download/features">↓ Entry features CSV</a><a class="btn" href="/download/decisions">↓ Decisions CSV</a><a class="btn" href="/download/events">↓ Management events</a><a class="btn" href="/download/shadow">↓ Shadow outcomes</a><a class="btn" href="/api/status">API status</a></div></div></div></body></html>'''
+
+def decision_funnel():
+    out={'NO_SETUP':0,'CANDIDATES':0,'OPEN':0,'BLOCKED':0,'BY_REASON':{}}
+    try:
+        if not os.path.exists(DECISIONS_FILE): return out
+        d=pd.read_csv(DECISIONS_FILE,usecols=lambda c:c in {'decision','side'})
+        if 'decision' not in d.columns:return out
+        vc=d['decision'].fillna('UNKNOWN').value_counts()
+        out['NO_SETUP']=int(vc.get('NO_SETUP',0))
+        out['OPEN']=int(vc.get('OPEN',0))
+        out['BLOCKED']=int(sum(int(v) for k,v in vc.items() if str(k).startswith('BLOCK_')))
+        out['CANDIDATES']=int((d.get('side',pd.Series(dtype=str)).fillna('NONE')!='NONE').sum())
+        out['BY_REASON']={str(k):int(v) for k,v in vc.items() if str(k)!='NO_SETUP'}
+    except Exception as e:
+        out['error']=repr(e)
+    return out
+
 app=Flask(__name__)
 def recent(n=30):
     rows=_read_csv_records(TRADES_FILE,n)
@@ -715,26 +739,26 @@ def dashboard():
     return render_template_string(DASH,s=stats(st),r=r,strat=strategy_dashboard(st),openpos=open_positions_dashboard(st,price),decisions=_read_csv_records(DECISIONS_FILE,36),regimes=regime_performance(),recent=recent())
 @app.get('/api/status')
 def status():
-    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.7.4-RESEARCH','run_mode':RUN_MODE,'stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
+    st=load_state(); c=load_candles(); return jsonify({'version':'BTC-V1.7.5-RESEARCH','run_mode':RUN_MODE,'decision_funnel':decision_funnel(),'stats':stats(st),'regime':regime_snapshot(c),'strategies':STRATEGIES})
 def dl(path,name):
     if not os.path.exists(path):return {'error':'Nog geen bestand.'},404
     return send_file(path,mimetype='text/csv',as_attachment=True,download_name=name)
 @app.get('/download/trades')
-def d1():return dl(TRADES_FILE,'btc_v174_trades.csv')
+def d1():return dl(TRADES_FILE,'btc_v175_trades.csv')
 @app.get('/download/features')
-def d2():return dl(FEATURES_FILE,'btc_v174_entries.csv')
+def d2():return dl(FEATURES_FILE,'btc_v175_entries.csv')
 @app.get('/download/decisions')
-def d3():return dl(DECISIONS_FILE,'btc_v174_decisions.csv')
+def d3():return dl(DECISIONS_FILE,'btc_v175_decisions.csv')
 @app.get('/download/events')
-def d4():return dl(EVENTS_FILE,'btc_v174_management_events.csv')
+def d4():return dl(EVENTS_FILE,'btc_v175_management_events.csv')
 @app.get('/download/shadow')
-def d5():return dl(SHADOW_FILE,'btc_v174_shadow_outcomes.csv')
+def d5():return dl(SHADOW_FILE,'btc_v175_shadow_outcomes.csv')
 @app.get('/health')
-def health():return {'status':'ok','version':'BTC-V1.7.4-RESEARCH','run_mode':RUN_MODE,'risk_per_trade':RISK_PER_TRADE},200
+def health():return {'status':'ok','version':'BTC-V1.7.5-RESEARCH','run_mode':RUN_MODE,'decision_funnel':decision_funnel(),'risk_per_trade':RISK_PER_TRADE},200
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),threaded=True,use_reloader=False)
 
 def main():
-    threading.Thread(target=run_dashboard,daemon=True).start();print(f'BTC V1.7.4 RESEARCH — PAPER ONLY — mode={RUN_MODE} — quality-gated independent strategy accounts — risk/trade={RISK_PER_TRADE:.2%}',flush=True)
+    threading.Thread(target=run_dashboard,daemon=True).start();print(f'BTC V1.7.5 RESEARCH — PAPER ONLY — mode={RUN_MODE} — auditable research accounts — costs measured/not censored — risk/trade={RISK_PER_TRADE:.2%}',flush=True)
     state=load_state();candles=update_candles(load_candles())
     while True:
         try:
@@ -767,9 +791,12 @@ def main():
                         order_ok,order_reason=validate_order_candidate(key,sig)
                         if not order_ok:
                             decision='BLOCK_'+order_reason
+                            start_shadow(state,sig,decision)
                         else:
                             risk_ok,risk_reason=risk_permission(st)
-                            if not risk_ok:decision='BLOCK_'+risk_reason
+                            if not risk_ok:
+                                decision='BLOCK_'+risk_reason
+                                start_shadow(state,sig,decision)
                             else:
                                 open_position(key,state,st,sig);decision='OPEN'
                     if decision!='OPEN':
