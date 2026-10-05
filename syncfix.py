@@ -5,29 +5,32 @@ import numpy as np
 import bot as core
 
 # -------------------------------------------------------------------
-# BTC V1.8.1 EXIT-SYNC RESEARCH
-# Clean forward dataset after V1.8.0's stale position-management issue.
-# The old v180 files are kept untouched for post-mortem analysis.
+# BTC V1.8.2 PROFIT-RATCHET RESEARCH
+# New clean forward dataset because exit policy materially changed.
+# V1.8.1 files remain untouched for comparison.
 # -------------------------------------------------------------------
-core.STATE_FILE = os.path.join(core.DATA_DIR, "btc_v181_state.json")
-core.TRADES_FILE = os.path.join(core.DATA_DIR, "btc_v181_trades.csv")
-core.FEATURES_FILE = os.path.join(core.DATA_DIR, "btc_v181_entries.csv")
-core.DECISIONS_FILE = os.path.join(core.DATA_DIR, "btc_v181_decisions.csv")
-core.EVENTS_FILE = os.path.join(core.DATA_DIR, "btc_v181_management_events.csv")
-core.SHADOW_FILE = os.path.join(core.DATA_DIR, "btc_v181_shadow_outcomes.csv")
-# Keep the existing candle cache. Candles were not the corrupted research output.
+core.STATE_FILE = os.path.join(core.DATA_DIR, "btc_v182_state.json")
+core.TRADES_FILE = os.path.join(core.DATA_DIR, "btc_v182_trades.csv")
+core.FEATURES_FILE = os.path.join(core.DATA_DIR, "btc_v182_entries.csv")
+core.DECISIONS_FILE = os.path.join(core.DATA_DIR, "btc_v182_decisions.csv")
+core.EVENTS_FILE = os.path.join(core.DATA_DIR, "btc_v182_management_events.csv")
+core.SHADOW_FILE = os.path.join(core.DATA_DIR, "btc_v182_shadow_outcomes.csv")
 
-# -------------------------------------------------------------------
-# Exit Engine 4.0 — remove the aggressive "almost everything scratches
-# at +0.08/+0.10R" behavior.
-# -------------------------------------------------------------------
+# Keep the proven V1.8.1 anti-stale protections.
 core.CONFIRMED_PROFIT_CLOSE_R = 999.0
 core.BE_TRIGGER_R = 999.0
 core.DYNAMIC_PROTECT_R = 999.0
+
+# Disable the old fixed +0.60R lock and close-based 0.85R trailing gap.
+# V1.8.2 replaces both with one monotonic MFE ratchet below.
+core.LOCK_TRIGGER_R = 999.0
+core.TRAIL_TRIGGER_R = 999.0
+
+# Structure protection remains a separate "thesis failed" protection.
 core.STRUCTURE_PROTECT_MFE_R = 1.00
 core.STRUCTURE_PROTECT_LOCK_R = 0.40
 
-import dashboard_patch  # installs the upgraded dashboard route on core.app
+import dashboard_patch  # installs upgraded dashboard on core.app
 
 _original_check_position = core.check_position
 _original_open_position = core.open_position
@@ -39,8 +42,78 @@ _enriched_cache_row = None
 _reconciling = False
 
 
+# -------------------------------------------------------------------
+# Profit Ratchet 1.0
+#
+# Designed as a broad, monotonic hypothesis — not fitted per strategy.
+# It protects progressively more of an excursion without choking a trade
+# before 1R. A stop is changed only AFTER a confirmed 5m candle, so the
+# system never assumes an impossible retroactive intrabar fill.
+#
+# MFE reached     Minimum locked R for NEXT bar
+# 1.00R           +0.30R
+# 1.25R           +0.75R
+# 1.50R           +1.00R
+# 1.75R           +1.20R
+# 2.00R           +1.45R
+# 2.50R           +1.90R
+# 3.00R+          max(+2.35R, MFE - 0.65R)
+# -------------------------------------------------------------------
+def ratchet_floor_r(mfe):
+    mfe = float(mfe or 0.0)
+
+    if mfe >= 3.00:
+        return max(2.35, mfe - 0.65)
+    if mfe >= 2.50:
+        return 1.90
+    if mfe >= 2.00:
+        return 1.45
+    if mfe >= 1.75:
+        return 1.20
+    if mfe >= 1.50:
+        return 1.00
+    if mfe >= 1.25:
+        return 0.75
+    if mfe >= 1.00:
+        return 0.30
+    return None
+
+
+def apply_profit_ratchet(key, p, t, close_r):
+    floor_r = ratchet_floor_r(p.get("mfe_r", 0.0))
+    if floor_r is None:
+        return False
+
+    entry = float(p["entry_price"])
+    dist = float(p["stop_distance"])
+
+    new_stop = (
+        entry + floor_r * dist
+        if p["side"] == "LONG"
+        else entry - floor_r * dist
+    )
+
+    old_stop = float(p["stop"])
+    core.move_stop(
+        key,
+        p,
+        t,
+        new_stop,
+        "PROFIT_RATCHET",
+        close_r,
+    )
+
+    changed = abs(float(p["stop"]) - old_stop) > 1e-9
+    if changed:
+        p["protected_stage"] = max(int(p.get("protected_stage", 0)), 4)
+        p["exit_state"] = "RATCHET"
+        p["ratchet_floor_r"] = floor_r
+
+    return changed
+
+
 def _enriched_management_bar(candle):
-    """Return the exact confirmed 5m bar enriched with EMA/ATR fields."""
+    """Return the exact confirmed 5m candle with EMA/ATR structure fields."""
     global _enriched_cache_ts, _enriched_cache_row
 
     try:
@@ -63,8 +136,9 @@ def _enriched_management_bar(candle):
             return _enriched_cache_row
 
     except Exception as e:
-        print("[WARN][EXIT-SYNC] management enrichment failed:", repr(e), flush=True)
+        print("[WARN][V182] management enrichment failed:", repr(e), flush=True)
 
+    # Fail safe: price-based TP/SL/time management stays alive.
     try:
         safe = candle.copy()
         safe["ema20"] = np.nan
@@ -74,12 +148,13 @@ def _enriched_management_bar(candle):
 
 
 def synced_open_position(key, state, account, sig):
-    """Open normally, then attach a per-position management cursor."""
     result = _original_open_position(key, state, account, sig)
 
     p = account.get("position")
     if p:
+        # Entry candle is known at entry and may not be replayed as management.
         p["last_checked_bar"] = pd.Timestamp(sig["time"]).isoformat()
+        p["ratchet_floor_r"] = None
 
     return result
 
@@ -88,7 +163,7 @@ core.open_position = synced_open_position
 
 
 def synced_check_position(key, state, account, candle):
-    """Process each confirmed 5m candle at most once for each position."""
+    """Exactly-once management per confirmed 5m candle + progressive profit ratchet."""
     p = account.get("position")
     if not p:
         return None
@@ -96,21 +171,39 @@ def synced_check_position(key, state, account, candle):
     ts = pd.Timestamp(candle.timestamp)
     last_checked = p.get("last_checked_bar")
 
-    if last_checked:
-        last_ts = pd.Timestamp(last_checked)
-        if ts <= last_ts:
-            return None
+    if last_checked and ts <= pd.Timestamp(last_checked):
+        return None
 
+    managed_bar = _enriched_management_bar(candle)
+
+    # The original manager first evaluates any stop/TP that existed BEFORE
+    # this completed candle. This preserves causal execution semantics.
     result = _original_check_position(
         key,
         state,
         account,
-        _enriched_management_bar(candle),
+        managed_bar,
     )
 
     surviving = account.get("position")
     if surviving is p:
         surviving["last_checked_bar"] = ts.isoformat()
+
+        cl = float(managed_bar.close)
+        close_r = (
+            (cl - surviving["entry_price"]) / surviving["stop_distance"]
+            if surviving["side"] == "LONG"
+            else (surviving["entry_price"] - cl) / surviving["stop_distance"]
+        )
+
+        # Ratchet is armed only after this bar closes. It is therefore active
+        # from the NEXT bar forward and cannot create a look-ahead fill.
+        apply_profit_ratchet(
+            key,
+            surviving,
+            ts,
+            close_r,
+        )
 
     return result
 
@@ -119,7 +212,7 @@ core.check_position = synced_check_position
 
 
 def reconcile_open_positions(state, candles=None):
-    """Replay only missing confirmed 5m bars for every open position."""
+    """Replay only missing confirmed 5m bars for each open position."""
     global _reconciling
 
     if _reconciling:
@@ -132,6 +225,7 @@ def reconcile_open_positions(state, candles=None):
         return 0
 
     _reconciling = True
+
     try:
         if candles is None:
             candles = core.load_candles()
@@ -157,12 +251,17 @@ def reconcile_open_positions(state, candles=None):
                 if not account.get("position"):
                     break
 
-                core.check_position(key, state, account, bar)
+                core.check_position(
+                    key,
+                    state,
+                    account,
+                    bar,
+                )
                 processed += 1
 
         if processed:
             print(
-                f"[RECONCILE] repaired {processed} missing position-management bars",
+                f"[RECONCILE][V182] managed {processed} missing position-bars",
                 flush=True,
             )
 
@@ -173,7 +272,7 @@ def reconcile_open_positions(state, candles=None):
 
 
 def save_state_with_reconciliation(state):
-    """Never persist a state that is behind the confirmed candle cache."""
+    """Never persist a position behind the confirmed-candle cache."""
     if any(
         st.get("position")
         for st in state.get("strategies", {}).values()
@@ -181,7 +280,7 @@ def save_state_with_reconciliation(state):
         try:
             reconcile_open_positions(state)
         except Exception as e:
-            print("[WARN][EXIT-SYNC] reconcile-before-save:", repr(e), flush=True)
+            print("[WARN][V182] reconcile-before-save:", repr(e), flush=True)
 
     return _original_save_state(state)
 
@@ -190,7 +289,7 @@ core.save_state = save_state_with_reconciliation
 
 
 def _safe_dashboard_price(state, fallback):
-    """Dashboard can never show a price newer than the slowest open position manager."""
+    """Do not show a market price newer than the slowest open position manager."""
     try:
         cursors = []
 
@@ -200,10 +299,8 @@ def _safe_dashboard_price(state, fallback):
 
         for account in state.get("strategies", {}).values():
             p = account.get("position")
-            if p:
-                c = p.get("last_checked_bar")
-                if c:
-                    cursors.append(pd.Timestamp(c))
+            if p and p.get("last_checked_bar"):
+                cursors.append(pd.Timestamp(p["last_checked_bar"]))
 
         if not cursors or not os.path.exists(core.CANDLES_FILE):
             return fallback
@@ -241,7 +338,6 @@ core.open_positions_dashboard = synced_open_positions_dashboard
 
 
 def startup_reconcile():
-    """Repair a persisted position before the main loop/dashboard starts."""
     try:
         state = core.load_state()
 
@@ -257,14 +353,14 @@ def startup_reconcile():
             _original_save_state(state)
 
     except Exception as e:
-        print("[WARN][EXIT-SYNC] startup reconciliation:", repr(e), flush=True)
+        print("[WARN][V182] startup reconciliation:", repr(e), flush=True)
 
 
 if __name__ == "__main__":
     print(
-        "[EXIT-SYNC V1.8.1] per-position candle cursor ON · "
-        "TP/SL reconciliation ON · early +0.08/+0.10R scratch rules OFF · "
-        "clean v181 dataset ON",
+        "[BTC V1.8.2 PROFIT-RATCHET] "
+        "clean v182 dataset ON · per-position sync ON · "
+        "old fixed +0.60R lock OFF · MFE ratchet ON",
         flush=True,
     )
 
